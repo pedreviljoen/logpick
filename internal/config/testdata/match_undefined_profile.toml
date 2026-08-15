@@ -1,0 +1,6 @@
+[profile.default]
+exec = ["ssh", "{host}", "--", "{cmd}"]
+
+[[match]]
+host = "*.prod.internal"
+profile = "missing"

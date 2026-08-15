@@ -1,0 +1,3 @@
+[profile.corp]
+exec = ["ssh", "{host}", "--", "{cmd}"]
+connect_timeout = "30s"

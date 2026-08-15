@@ -1,0 +1,16 @@
+# Three distinct, independent faults for the "several distinct faults are
+# reported in one error" mechanic:
+#   1. profile "solid" uses an unknown placeholder, {oops}, in exec.
+#   2. the [[match]] rule names profile "ghost", which is never defined.
+#   3. the [host.myhost] entry names profile "phantom", which is never
+#      defined.
+
+[profile.solid]
+exec = ["ssh", "{host}", "--", "{oops}"]
+
+[[match]]
+host = "*.example.com"
+profile = "ghost"
+
+[host.myhost]
+profile = "phantom"

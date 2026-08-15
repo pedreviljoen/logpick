@@ -1,0 +1,29 @@
+[profile.default]
+exec = ["ssh", "{host}", "--", "{cmd}"]
+
+[profile.corp]
+exec = ["corp-bastion", "connect", "{host}", "--exec", "{cmd}"]
+copy = ["corp-bastion", "scp", "{host}:{remote}", "{local}"]
+persistent = true
+connect_timeout = "30s"
+auth_hint = "corp-bastion login"
+
+[profile.corp.scan]
+paths = ["/var/log", "/opt/app/logs", "/srv/*/logs"]
+max_depth = 3
+include = ["*.log", "*.log.*", "*.out", "messages", "syslog"]
+exclude = ["*.gz", "*.zip", "lastlog", "wtmp", "btmp"]
+
+[[match]]
+host = "*.prod.internal"
+profile = "corp"
+
+[[match]]
+host = "*.staging.internal"
+profile = "corp"
+scan.paths = ["/var/log", "/opt/app/logs", "/tmp/debug"]
+
+[host.jenkins-01]
+profile = "corp"
+scan.paths = ["/var/lib/jenkins/logs"]
+label = "CI primary"

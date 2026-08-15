@@ -1,0 +1,36 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - gosec
+    - ineffassign
+    - unused
+  settings:
+    govet:
+      enable:
+        - shadow
+    gosec:
+      excludes:
+        # The whole tool is subprocess management over user-configured argv
+        # templates. See DESIGN.md section 12 for the security model.
+        - G204
+  exclusions:
+    rules:
+      - path: _test\.go$
+        linters:
+          - errcheck
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/pedreviljoen/logpick

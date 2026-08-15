@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./cmd/logpick
+      - run: go test ./...
+      - run: go test -race ./...
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./cmd/logpick
+      - run: go test ./...
+
+  # AGENTS.md section 2: tests and implementation are written by different
+  # agents, so an implementation commit must not touch a test. Commits that
+  # deliberately carry all three phases opt out with a "Phase:" trailer.
+  no-test-diff:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assert implementation commits change no tests
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          fail=0
+          for sha in $(git rev-list "$BASE".."$HEAD"); do
+            subject=$(git log -1 --format=%s "$sha")
+            case "$subject" in
+              feat*|fix*) ;;
+              *) continue ;;
+            esac
+            if git log -1 --format=%B "$sha" | grep -q '^Phase:'; then
+              continue
+            fi
+            offending=$(git diff-tree --no-commit-id --name-only -r "$sha" \
+              | grep -E '(_test\.go$|(^|/)testdata/)' || true)
+            if [ -n "$offending" ]; then
+              echo "::error::$sha ($subject) is an implementation commit but changes test files:"
+              echo "$offending"
+              fail=1
+            fi
+          done
+          exit $fail

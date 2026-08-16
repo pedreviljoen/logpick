@@ -1,0 +1,3 @@
+info: startup ok
+error: err404 not found
+warn: retry err12 then err404 again

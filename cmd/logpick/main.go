@@ -28,6 +28,7 @@ func newRootCmd() *cobra.Command {
 		Version:       buildVersion(),
 	}
 	root.SetVersionTemplate("logpick {{.Version}}\n")
+	root.AddCommand(newScanCmd())
 	return root
 }
 

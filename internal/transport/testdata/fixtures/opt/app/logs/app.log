@@ -1,0 +1,5 @@
+2026-08-10T07:00:00Z INFO  boot complete
+2026-08-10T07:00:01Z INFO  listening on :8080
+2026-08-10T07:15:33Z INFO  request served path=/healthz status=200
+2026-08-10T07:16:02Z ERROR request failed path=/widgets status=500
+2026-08-10T07:16:02Z ERROR stack: widget_lookup() -> nil pointer

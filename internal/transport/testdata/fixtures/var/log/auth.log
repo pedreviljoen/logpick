@@ -1,0 +1,3 @@
+2026-08-10T08:00:00Z host sshd[900]: Server listening on 0.0.0.0 port 22.
+2026-08-10T09:02:11Z host sshd[901]: Accepted publickey for deploy from 10.0.0.4 port 51322 ssh2
+2026-08-10T09:02:11Z host sshd[901]: pam_unix(sshd:session): session opened for user deploy

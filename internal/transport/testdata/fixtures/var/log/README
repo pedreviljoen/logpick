@@ -1,0 +1,3 @@
+This directory mirrors a typical Linux host's /var/log for logpick's mock
+transport fixtures. Files here are tiny and fictional, and none of it is a
+real log format worth parsing beyond what logpick itself needs.

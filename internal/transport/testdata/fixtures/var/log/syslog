@@ -1,0 +1,4 @@
+2026-08-10T08:00:01Z host systemd[1]: Started system logging daemon.
+2026-08-10T08:00:05Z host cron[512]: (root) CMD (run-parts /etc/cron.hourly)
+2026-08-10T08:15:02Z host kernel: [    0.000000] Linux version 6.8.0
+2026-08-10T09:02:11Z host sshd[901]: Accepted publickey for deploy from 10.0.0.4

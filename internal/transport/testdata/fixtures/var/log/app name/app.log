@@ -1,0 +1,4 @@
+2026-08-10T09:10:00Z INFO  starting worker pool size=4
+2026-08-10T09:10:01Z INFO  connected to queue
+2026-08-10T09:12:44Z WARN  retrying job 8827, attempt 2
+2026-08-10T09:12:45Z ERROR job 8827 failed: timeout waiting for upstream

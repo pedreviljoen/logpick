@@ -1,0 +1,7 @@
+# Personal note: jenkins-01 is flaky right after 2am, don't page on it.
+[profile.corp]
+exec = ["ssh", "{host}", "--", "{cmd}"]
+
+[[match]]
+host = "*.prod.internal"
+profile = "corp"

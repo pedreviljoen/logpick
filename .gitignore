@@ -33,3 +33,6 @@ go.work.sum
 
 agents/
 .claude/
+
+# Built binary
+/logpick

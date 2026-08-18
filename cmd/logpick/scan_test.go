@@ -166,6 +166,26 @@ func loadCaps(t *testing.T, store *state.Store, host string) state.Caps {
 
 func strPtr(s string) *string { return &s }
 
+func TestProbeGNUFindDoesNotDeadlockOnCapturedStderr(t *testing.T) {
+	profile := config.Profile{Exec: []string{"/bin/sh", "-c", `printf warning >&2`}}
+	tp := transport.NewCommand("test-host", profile)
+	defer func() { _ = tp.Close() }()
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- probeGNUFind(context.Background(), tp)
+	}()
+
+	select {
+	case got := <-done:
+		if !got {
+			t.Fatal("probeGNUFind = false, want successful command to report GNU find")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("probeGNUFind deadlocked draining stderr before Process.Wait")
+	}
+}
+
 func TestRunScan(t *testing.T) {
 	t.Run("entries sorted by mtime descending", func(t *testing.T) {
 		dir := copyFixtures(t)

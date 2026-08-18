@@ -128,6 +128,16 @@ func TestCtrlNCtrlPMoveCursorAndStopAtBounds(t *testing.T) {
 			want:    1,
 		},
 		{
+			name:    "down arrow moves the cursor to the next match",
+			presses: []tea.KeyType{tea.KeyDown},
+			want:    1,
+		},
+		{
+			name:    "up arrow moves the cursor to the previous match",
+			presses: []tea.KeyType{tea.KeyDown, tea.KeyDown, tea.KeyUp},
+			want:    1,
+		},
+		{
 			name:    "ctrl+n stops at the last match",
 			presses: []tea.KeyType{tea.KeyCtrlN, tea.KeyCtrlN, tea.KeyCtrlN, tea.KeyCtrlN},
 			want:    2,

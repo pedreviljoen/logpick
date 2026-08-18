@@ -36,6 +36,7 @@ type Config struct {
 	Profiles map[string]Profile   `toml:"profile"`
 	Matches  []MatchRule          `toml:"match"`
 	Hosts    map[string]HostEntry `toml:"host"`
+	Theme    ThemeConfig          `toml:"theme"`
 
 	// Warnings holds non-fatal problems noticed while loading, such as a
 	// config.toml that is group- or world-writable (DESIGN.md section 12).
@@ -43,6 +44,13 @@ type Config struct {
 	// returning a usable Config. Warnings is never populated from the TOML
 	// file itself; Load is the only writer.
 	Warnings []string `toml:"-"`
+}
+
+// ThemeConfig customizes the interactive color palette with optional #RRGGBB
+// hex values.
+type ThemeConfig struct {
+	Primary   string `toml:"primary"`
+	Secondary string `toml:"secondary"`
 }
 
 // Profile describes how to reach a class of hosts: the command template

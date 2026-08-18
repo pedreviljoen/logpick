@@ -102,6 +102,21 @@ func writeRawState(t *testing.T, path string, st *State) []byte {
 	return data
 }
 
+func TestSetTheme(t *testing.T) {
+	s, _ := newStore(t)
+	if err := s.SetTheme("#112233", "#ffaa00"); err != nil {
+		t.Fatalf("SetTheme: %v", err)
+	}
+	got, err := s.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := Theme{Configured: true, Primary: "#112233", Secondary: "#ffaa00"}
+	if got.Theme != want {
+		t.Fatalf("theme = %+v, want %+v", got.Theme, want)
+	}
+}
+
 func TestStore(t *testing.T) {
 	t.Run("a save followed by a load returns equivalent state", func(t *testing.T) {
 		s, _ := newStore(t)

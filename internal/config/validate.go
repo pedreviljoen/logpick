@@ -10,6 +10,7 @@ import (
 // placeholderPattern matches a {word} style template placeholder, e.g.
 // {host} or the unknown {oops} used in the multi-fault test fixture.
 var placeholderPattern = regexp.MustCompile(`\{([a-zA-Z]+)\}`)
+var hexColorPattern = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)
 
 // knownPlaceholders is the set of substitutions Substitute (T03) honours.
 // See DESIGN.md sections 7.2 and 12: anything outside this set is a config
@@ -56,6 +57,20 @@ func checkTemplate(profile, kind string, tmpl []string) []error {
 
 // validateProfileReferences checks that every profile named by a [[match]]
 // rule or a [host.<name>] entry is defined under [profile.*].
+func validateTheme(cfg *Config) []error {
+	var faults []error
+	fields := []struct{ name, value string }{
+		{"primary", cfg.Theme.Primary},
+		{"secondary", cfg.Theme.Secondary},
+	}
+	for _, field := range fields {
+		if field.value != "" && !hexColorPattern.MatchString(field.value) {
+			faults = append(faults, fmt.Errorf("theme.%s must be a #RRGGBB hex color: %w", field.name, ErrInvalidConfig))
+		}
+	}
+	return faults
+}
+
 func validateProfileReferences(cfg *Config) []error {
 	var faults []error
 

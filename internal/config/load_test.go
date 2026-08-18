@@ -99,6 +99,21 @@ func TestLoad(t *testing.T) {
 		}
 	})
 
+	t.Run("theme hex colors load", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte("[theme]\nprimary = \"#112233\"\nsecondary = \"#ffaa00\"\n"), 0o600); err != nil {
+			t.Fatalf("writing theme config: %v", err)
+		}
+		got, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load theme config: %v", err)
+		}
+		want := ThemeConfig{Primary: "#112233", Secondary: "#ffaa00"}
+		if got.Theme != want {
+			t.Fatalf("theme = %+v, want %+v", got.Theme, want)
+		}
+	})
+
 	t.Run("several distinct faults are reported in one error", func(t *testing.T) {
 		got, err := Load(fixture(t, "multi_fault.toml"))
 		if err == nil {

@@ -55,6 +55,7 @@ func Load(path string) (*Config, error) {
 	var faults []error
 	faults = append(faults, validatePlaceholders(&cfg)...)
 	faults = append(faults, validateProfileReferences(&cfg)...)
+	faults = append(faults, validateTheme(&cfg)...)
 
 	if len(faults) > 0 {
 		return nil, errors.Join(faults...)

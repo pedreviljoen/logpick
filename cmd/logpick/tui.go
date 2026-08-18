@@ -43,9 +43,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -76,6 +78,11 @@ import (
 // backend (transport.NewCommand, or --mock's transport.Mock) and stores
 // rooted at the real XDG paths.
 type appDeps struct {
+	// NewTransport builds a host-bound transport for first-run probes. When
+	// nil (primarily in focused unit tests), hostsProbeFunc falls back to
+	// Transport.
+	NewTransport func(host string, profile config.Profile) transport.Transport
+
 	// Transport is the backend every screen's injected func issues its
 	// Exec calls against: preview (tail -n) for the browser, the scan
 	// itself (find, via BuildScan) for the browser's file list, follow
@@ -124,6 +131,11 @@ type appDeps struct {
 	// at all rather than being a wireTUI-local variable, since Config
 	// (unlike Host and Transport) does not change across that rebuild.
 	Config *config.Config
+
+	// ThemePrimary and ThemeSecondary are the active palette values. Tool-owned
+	// state overrides optional config defaults.
+	ThemePrimary   string
+	ThemeSecondary string
 
 	// ConfigPath is where the hosts screen's first-run flow persists a
 	// newly probed host's profile (hosts.WriteConfigFile's target). It is
@@ -176,14 +188,24 @@ func (d appDeps) scanDeps() deps {
 // routes everything else straight to the active screen. See this file's
 // package doc comment and tuiModel below for the type that does that.
 func newApp(d appDeps) (ui.App, error) {
+	theme := ui.DefaultTheme().WithColors(d.ThemePrimary, d.ThemeSecondary)
 	hostsScreen := hosts.New(d.Config, hostsListFunc(d),
 		hosts.WithRemover(func(host string) error { return d.State.Remove(host) }),
 		hosts.WithPinner(func(host string, pinned bool) error { return d.State.Pin(host, pinned) }),
 		hosts.WithProber(hostsProbeFunc(d)),
 		hosts.WithWriter(hosts.WriteConfigFile(d.ConfigPath)),
+		hosts.WithTheme(theme),
+		hosts.WithPalette(d.ThemePrimary, d.ThemeSecondary),
+		hosts.WithThemeSaver(d.State.SetTheme),
 	)
 
-	browserScreen := browser.New(d.Host.Name, previewFunc(d))
+	browserScreen := browser.New(
+		d.Host.Name,
+		previewFunc(d),
+		browser.WithSelector(selectLogFunc(d)),
+		browser.WithSearch(browserSearchFunc(d)),
+		browser.WithTheme(theme),
+	)
 
 	libraryScreen := library.New(libraryDeleteFunc(d))
 
@@ -195,6 +217,9 @@ func newApp(d appDeps) (ui.App, error) {
 		ui.ScreenLibrary: libraryScreen,
 		ui.ScreenViewer:  viewerScreen,
 	})
+	app.Theme = theme
+	app.ThemePrimary = d.ThemePrimary
+	app.ThemeSecondary = d.ThemeSecondary
 
 	return app, nil
 }
@@ -238,23 +263,34 @@ func hostLabel(cfg *config.Config, host string) string {
 // liveness probe, run as d.Transport.Check per this func's own doc
 // comment on newApp.
 //
-// This is a known simplification, not covered by any test: for the real
-// (non-mock) backend, d.Transport is bound to whichever host newApp was
-// constructed against, not necessarily the new hostname a user types into
-// the first-run field, since hosts.ProbeFunc's host and exec parameters
-// name a host newApp has never seen. Building a fresh, correctly-host-bound
-// transport.Transport per probe would need the same host/mock factory
-// tuiModel uses for ui.HostSelectedMsg, which hosts.New's caller (newApp)
-// does not have - only appDeps, a single Transport. For --mock, where a
-// Transport is never host-bound in the first place, this is exactly
-// correct; for a real host it probes d.Host rather than the newly typed
-// one. Closing that gap precisely is future work, not part of this task's
-// named architectural gap (ui.HostSelectedMsg / the browser), so it is
-// called out here rather than silently accepted.
+// When NewTransport is configured, the probe gets a fresh transport bound
+// to the hostname the user actually typed and closes it afterward. Focused
+// tests that omit the factory fall back to d.Transport.
 func hostsProbeFunc(d appDeps) hosts.ProbeFunc {
 	return func(ctx context.Context, host string, exec []string) error {
-		return d.Transport.Check(ctx)
+		if d.NewTransport == nil {
+			return connectionProbeError(d.Transport.Check(ctx))
+		}
+
+		profile := config.DefaultProfile
+		profile.Exec = append([]string(nil), exec...)
+		tp := d.NewTransport(host, profile)
+		defer func() { _ = tp.Close() }()
+		return connectionProbeError(tp.Check(ctx))
 	}
+}
+
+func connectionProbeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, transport.ErrAuthRequired) {
+		return fmt.Errorf(
+			"%w; check the remote user and identity file (EC2 commonly uses ubuntu@host or ec2-user@host)",
+			transport.ErrAuthRequired,
+		)
+	}
+	return err
 }
 
 // previewFunc returns the browser.PreviewFunc newApp wires: the equivalent
@@ -266,12 +302,110 @@ func hostsProbeFunc(d appDeps) hosts.ProbeFunc {
 func previewFunc(d appDeps) browser.PreviewFunc {
 	return func(ctx context.Context, host, path string) ([]string, error) {
 		cmd := fmt.Sprintf("tail -n 100 %s", remote.Quote(path))
-		lines, err := execLines(ctx, d.Transport, cmd)
-		if err != nil {
-			return nil, fmt.Errorf("preview %s:%s: %w", host, path, err)
+
+		if len(d.Host.Profile.SudoPrefix) > 0 {
+			lines, err := execLines(ctx, d.Transport, prefixRemoteCommand(d.Host.Profile.SudoPrefix, cmd))
+			if err != nil && isRemotePermissionDenied(err) {
+				return nil, fmt.Errorf("permission denied reading %s with the configured sudo prefix", path)
+			}
+			return lines, err
 		}
-		return lines, nil
+
+		lines, err := execLines(ctx, d.Transport, cmd)
+		if err == nil {
+			return lines, nil
+		}
+		if !isRemotePermissionDenied(err) {
+			return nil, err
+		}
+
+		// Discovery can stat files that the login user cannot read. EC2's
+		// standard users commonly have passwordless sudo, so retry read-only
+		// preview access non-interactively; -n guarantees this never hangs on a
+		// password prompt.
+		lines, sudoErr := execLines(ctx, d.Transport, "sudo -n "+cmd)
+		if sudoErr == nil {
+			return lines, nil
+		}
+		return nil, fmt.Errorf(
+			"permission denied reading %s; grant %s read access or allow passwordless sudo",
+			path,
+			host,
+		)
 	}
+}
+
+type prefixedTransport struct {
+	transport.Transport
+	prefix []string
+}
+
+func (t *prefixedTransport) Exec(ctx context.Context, cmd string) (*transport.Process, error) {
+	return t.Transport.Exec(ctx, prefixRemoteCommand(t.prefix, cmd))
+}
+
+func (t *prefixedTransport) Fetch(ctx context.Context, remotePath, localPath string, progress chan<- transport.Progress) (int64, error) {
+	return transport.FallbackFetcher{T: t}.Fetch(ctx, remotePath, localPath, progress)
+}
+
+func selectLogFunc(d appDeps) browser.SelectFunc {
+	return func(ctx context.Context, host string, entry ui.ScanEntry) (string, []string, error) {
+		at := d.Now()
+		tp := d.Transport
+		if len(d.Host.Profile.SudoPrefix) > 0 {
+			tp = &prefixedTransport{Transport: d.Transport, prefix: d.Host.Profile.SudoPrefix}
+		}
+
+		localPath, _, err := d.Local.Fetch(ctx, tp, d.State, host, entry.Path, entry.Size, at, nil)
+		if err != nil && len(d.Host.Profile.SudoPrefix) == 0 && isRemotePermissionDenied(err) {
+			sudo := &prefixedTransport{Transport: d.Transport, prefix: []string{"sudo", "-n"}}
+			localPath, _, err = d.Local.Fetch(ctx, sudo, d.State, host, entry.Path, entry.Size, at, nil)
+		}
+		if err != nil {
+			var confirm *local.ConfirmRequiredError
+			if errors.As(err, &confirm) {
+				return "", nil, fmt.Errorf("log is %d MB; files at or above 500 MB require a bounded-tail fetch", confirm.Size/(1024*1024))
+			}
+			return "", nil, err
+		}
+
+		data, err := os.ReadFile(localPath) //nolint:gosec // localPath was created under logpick's local store by Fetch above.
+		if err != nil {
+			return "", nil, fmt.Errorf("reading local snapshot %s: %w", localPath, err)
+		}
+		content := strings.TrimSuffix(string(data), "\n")
+		if content == "" {
+			return localPath, []string{}, nil
+		}
+		return localPath, strings.Split(content, "\n"), nil
+	}
+}
+
+func browserSearchFunc(d appDeps) browser.SearchFunc {
+	return func(ctx context.Context, path, query string, regex bool) ([]ui.SearchMatch, error) {
+		matches, err := d.Search.Search(ctx, path, local.Query{Pattern: query, Regex: regex})
+		if err != nil {
+			return nil, err
+		}
+		out := make([]ui.SearchMatch, len(matches))
+		for i, match := range matches {
+			out[i] = ui.SearchMatch{Line: match.Line, Start: match.Start, End: match.End, Text: match.Text}
+		}
+		return out, nil
+	}
+}
+
+func prefixRemoteCommand(prefix []string, cmd string) string {
+	quoted := make([]string, len(prefix))
+	for i, part := range prefix {
+		quoted[i] = remote.Quote(part)
+	}
+	return strings.Join(quoted, " ") + " " + cmd
+}
+
+func isRemotePermissionDenied(err error) bool {
+	var exitErr *transport.ExitError
+	return errors.As(err, &exitErr) && strings.Contains(strings.ToLower(exitErr.Stderr), "permission denied")
 }
 
 // libraryDeleteFunc returns the library.DeleteFunc newApp wires: it
@@ -592,18 +726,20 @@ func wireTUI(root *cobra.Command) {
 			ov.Paths = &pathFlags
 		}
 
-		var cfg *config.Config
-		if configPath != "" {
-			loaded, loadErr := config.Load(configPath)
-			if loadErr != nil {
-				return loadErr
-			}
-			cfg = loaded
-		}
-
 		writeConfigPath := configPath
 		if writeConfigPath == "" {
 			writeConfigPath = defaultConfigPath()
+		}
+
+		// Read the default config when it exists. The first-run flow writes
+		// this path, so ignoring it on the next launch would make the generated
+		// host profile unusable.
+		var cfg *config.Config
+		loaded, loadErr := config.Load(writeConfigPath)
+		if loadErr == nil {
+			cfg = loaded
+		} else if configPath != "" || !errors.Is(loadErr, os.ErrNotExist) {
+			return loadErr
 		}
 
 		resolved, err := config.Resolve(cfg, host, ov)
@@ -618,15 +754,41 @@ func wireTUI(root *cobra.Command) {
 			return transport.NewCommand(host, profile)
 		}
 
+		stateStore := state.New(statePath)
+		storedState, stateErr := stateStore.Load()
+		if stateErr != nil {
+			return stateErr
+		}
+		themePrimary, themeSecondary := "", ""
+		if cfg != nil {
+			themePrimary = cfg.Theme.Primary
+			themeSecondary = cfg.Theme.Secondary
+		}
+		if storedState.Theme.Configured {
+			themePrimary = storedState.Theme.Primary
+			themeSecondary = storedState.Theme.Secondary
+		}
+
+		localRoot := defaultLocalRoot()
+		if mkdirErr := os.MkdirAll(localRoot, 0o700); mkdirErr != nil {
+			return fmt.Errorf("creating local log store %s: %w", localRoot, mkdirErr)
+		}
+		if chmodErr := os.Chmod(localRoot, 0o700); chmodErr != nil {
+			return fmt.Errorf("securing local log store %s: %w", localRoot, chmodErr)
+		}
+
 		base := appDeps{
-			Transport:  newTransport(host, resolved.Profile),
-			State:      state.New(statePath),
-			Local:      local.New(defaultLocalRoot()),
-			Search:     local.Choose(""),
-			Host:       resolved,
-			Now:        time.Now,
-			Config:     cfg,
-			ConfigPath: writeConfigPath,
+			NewTransport:   newTransport,
+			Transport:      newTransport(host, resolved.Profile),
+			State:          stateStore,
+			Local:          local.New(localRoot),
+			Search:         local.Choose(""),
+			Host:           resolved,
+			Now:            time.Now,
+			Config:         cfg,
+			ThemePrimary:   themePrimary,
+			ThemeSecondary: themeSecondary,
+			ConfigPath:     writeConfigPath,
 		}
 
 		app, err := newApp(base)
@@ -635,16 +797,24 @@ func wireTUI(root *cobra.Command) {
 		}
 
 		resolveHost := func(host, profileName string) (appDeps, error) {
-			var hov config.Overrides
-			if profileName != "" {
-				hov = config.Overrides{Profile: &profileName}
+			// Reload here because the first-run hosts flow may have just written
+			// this file after the application was constructed.
+			currentCfg := cfg
+			loaded, loadErr := config.Load(writeConfigPath)
+			if loadErr == nil {
+				currentCfg = loaded
+			} else if !errors.Is(loadErr, os.ErrNotExist) {
+				return appDeps{}, loadErr
 			}
-			hostResolved, resolveErr := config.Resolve(cfg, host, hov)
+
+			hov := historyProfileOverrides(profileName)
+			hostResolved, resolveErr := config.Resolve(currentCfg, host, hov)
 			if resolveErr != nil {
 				return appDeps{}, resolveErr
 			}
 
 			nd := base
+			nd.Config = currentCfg
 			nd.Host = hostResolved
 			nd.Transport = newTransport(host, hostResolved.Profile)
 			return nd, nil
@@ -674,7 +844,7 @@ func wireTUI(root *cobra.Command) {
 			}
 		}()
 
-		p := tea.NewProgram(wrapped, tea.WithContext(ctx))
+		p := tea.NewProgram(wrapped, tea.WithContext(ctx), tea.WithAltScreen())
 		finalModel, runErr := p.Run()
 		if tm, ok := finalModel.(tuiModel); ok && tm.active.Transport != nil {
 			_ = tm.active.Transport.Close()
@@ -687,6 +857,16 @@ func wireTUI(root *cobra.Command) {
 	root.Flags().StringVar(&mockDir, "mock", "", "serve this fixture directory instead of a real transport, no network")
 	root.Flags().StringVar(&configPath, "config", "", "path to config.toml (default: built-in defaults only)")
 	root.Flags().StringVar(&statePath, "state", defaultStatePath(), "path to state.toml")
+}
+
+// historyProfileOverrides translates a profile stored in host history back
+// into resolution overrides. "default" must remain implicit: it may name the
+// built-in fallback even when no [profile.default] exists in config.toml.
+func historyProfileOverrides(profileName string) config.Overrides {
+	if profileName == "" || profileName == config.DefaultProfileName {
+		return config.Overrides{}
+	}
+	return config.Overrides{Profile: &profileName}
 }
 
 // defaultConfigPath returns $XDG_CONFIG_HOME/logpick/config.toml, falling
@@ -865,9 +1045,26 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ui.HostSelectedMsg:
 		return m.selectHost(msg)
 
+	case ui.ThemeChangedMsg:
+		next, cmd := m.routeToApp(msg)
+		next.active.ThemePrimary = msg.Primary
+		next.active.ThemeSecondary = msg.Secondary
+		return next, cmd
+
+	case ui.PathScanRequestedMsg:
+		return m.scanPath(msg)
+
+	case scanReadyMsg:
+		return m.startScan(msg)
+
 	case ui.ScanEntriesMsg:
 		next, cmd := m.routeToApp(msg)
 		return next, tea.Batch(cmd, scanDrainCmd(msg.Host, m.scanEntries, m.scanReport))
+
+	case ui.PreviewMsg:
+		next, cmd := m.routeToApp(msg)
+		next.app.Err = nil
+		return next, cmd
 
 	case ui.ErrorMsg:
 		next, cmd := m.routeToApp(msg)
@@ -905,29 +1102,127 @@ func (m tuiModel) routeToApp(msg tea.Msg) (tuiModel, tea.Cmd) {
 // (resolving the host's find dialect via resolveGNUFind, shared with
 // scan.go rather than duplicated) whose drain scanDrainCmd is reissued by
 // the ui.ScanEntriesMsg case in Update above.
+// scanReadyMsg is an internal message sent once the blocking
+// resolveGNUFind probe completes, carrying everything selectHost needs
+// to start the scan and its drain.  Moving the probe into a tea.Cmd
+// keeps Update non-blocking so the TUI stays responsive while SSH
+// connects.
+type scanReadyMsg struct {
+	Host    string
+	Deps    appDeps
+	GNUFind bool
+}
+
 func (m tuiModel) selectHost(msg ui.HostSelectedMsg) (tea.Model, tea.Cmd) {
 	newDeps, err := m.resolve(msg.Host, msg.Profile)
 	if err != nil {
 		return m, errCmd(fmt.Errorf("resolving host %q: %w", msg.Host, err))
+	}
+	newDeps.ThemePrimary = m.app.ThemePrimary
+	newDeps.ThemeSecondary = m.app.ThemeSecondary
+
+	if m.scanCancel != nil {
+		m.scanCancel()
+	}
+
+	browserScreen := browser.New(
+		newDeps.Host.Name,
+		previewFunc(newDeps),
+		browser.WithSelector(selectLogFunc(newDeps)),
+		browser.WithSearch(browserSearchFunc(newDeps)),
+		browser.WithTheme(ui.DefaultTheme().WithColors(newDeps.ThemePrimary, newDeps.ThemeSecondary)),
+		browser.WithContextFunc(func() (context.Context, context.CancelFunc) {
+			return context.WithCancel(m.ctx)
+		}),
+	)
+
+	next := m
+	next.active = newDeps
+	next.app.Screens[ui.ScreenBrowser] = browserScreen
+	next.app.Active = ui.ScreenBrowser
+	next.app.Err = nil
+
+	// Resize the newly installed browser screen so it has dimensions.
+	if next.app.Width > 0 && next.app.Height > 0 {
+		next.app.Screens[ui.ScreenBrowser] = next.app.Screens[ui.ScreenBrowser].Resize(
+			next.app.Width, ui.ContentHeight(next.app.Height),
+		)
+	}
+
+	// resolveGNUFind does blocking I/O (state load + SSH probe), so run
+	// it in a tea.Cmd rather than inline in Update.
+	ctx := m.ctx
+	host := msg.Host
+	probeCmd := func() tea.Msg {
+		gnuFind, err := resolveGNUFind(ctx, newDeps.scanDeps(), host)
+		if err != nil {
+			return ui.ErrorMsg{Err: fmt.Errorf("probing %q: %w", host, err)}
+		}
+		return scanReadyMsg{Host: host, Deps: newDeps, GNUFind: gnuFind}
+	}
+
+	connectAt := newDeps.Now()
+	cmds := []tea.Cmd{
+		cachedScanCmd(newDeps, host),
+		func() tea.Msg { return ui.ScanStartedMsg{Host: host} },
+		probeCmd,
+		func() tea.Msg {
+			if err := newDeps.State.RecordConnect(host, newDeps.Host.ProfileName, connectAt); err != nil {
+				return ui.ErrorMsg{Err: fmt.Errorf("recording connect to %q: %w", host, err)}
+			}
+			return nil
+		},
+	}
+
+	return next, tea.Batch(cmds...)
+}
+
+func (m tuiModel) scanPath(msg ui.PathScanRequestedMsg) (tea.Model, tea.Cmd) {
+	if msg.Host != m.active.Host.Name || strings.TrimSpace(msg.Path) == "" {
+		return m, nil
+	}
+	if m.scanCancel != nil {
+		m.scanCancel()
+	}
+
+	deps := m.active
+	deps.Host.Profile.Scan.Paths = []string{strings.TrimSpace(msg.Path)}
+	host := msg.Host
+	ctx := m.ctx
+	probeCmd := func() tea.Msg {
+		gnuFind, err := resolveGNUFind(ctx, deps.scanDeps(), host)
+		if err != nil {
+			return ui.ErrorMsg{Err: fmt.Errorf("probing %q: %w", host, err)}
+		}
+		return scanReadyMsg{Host: host, Deps: deps, GNUFind: gnuFind}
+	}
+
+	next := m
+	next.app.Err = nil
+	return next, tea.Batch(
+		func() tea.Msg { return ui.PathScanStartedMsg{Host: host, Path: msg.Path} },
+		probeCmd,
+	)
+}
+
+// startScan handles scanReadyMsg: now that the blocking probe has
+// completed asynchronously, it creates the scan channels, launches the
+// scan goroutine, and starts draining entries into the browser.
+func (m tuiModel) startScan(msg scanReadyMsg) (tea.Model, tea.Cmd) {
+	// A slower probe for a previously selected host may finish after the user
+	// has selected another one. Never let that stale result replace the active
+	// host's scan channels.
+	if msg.Host != m.active.Host.Name {
+		return m, nil
 	}
 
 	if m.scanCancel != nil {
 		m.scanCancel()
 	}
 
-	browserScreen := browser.New(newDeps.Host.Name, previewFunc(newDeps))
+	scanCtx, cancel := context.WithCancel(m.ctx)
 
 	next := m
-	next.active = newDeps
-	next.app.Screens[ui.ScreenBrowser] = browserScreen
-	next.app.Active = ui.ScreenBrowser
-
-	gnuFind, err := resolveGNUFind(m.ctx, newDeps.scanDeps(), msg.Host)
-	if err != nil {
-		return next, errCmd(fmt.Errorf("probing %q: %w", msg.Host, err))
-	}
-
-	scanCtx, cancel := context.WithCancel(m.ctx)
 	next.scanCancel = cancel
 
 	entries := make(chan remote.Entry)
@@ -935,22 +1230,9 @@ func (m tuiModel) selectHost(msg ui.HostSelectedMsg) (tea.Model, tea.Cmd) {
 	next.scanEntries = entries
 	next.scanReport = report
 
-	ui.SafeGo(scanCtx, next.errc, scanRun(newDeps, gnuFind, entries, report))
+	ui.SafeGo(scanCtx, next.errc, scanRun(msg.Deps, msg.GNUFind, entries, report))
 
-	connectAt := newDeps.Now()
-	cmds := []tea.Cmd{
-		cachedScanCmd(newDeps, msg.Host),
-		func() tea.Msg { return ui.ScanStartedMsg{Host: msg.Host} },
-		scanDrainCmd(msg.Host, entries, report),
-		func() tea.Msg {
-			if err := newDeps.State.RecordConnect(msg.Host, newDeps.Host.ProfileName, connectAt); err != nil {
-				return ui.ErrorMsg{Err: fmt.Errorf("recording connect to %q: %w", msg.Host, err)}
-			}
-			return nil
-		},
-	}
-
-	return next, tea.Batch(cmds...)
+	return next, scanDrainCmd(msg.Host, entries, report)
 }
 
 // errCmd returns a tea.Cmd that reports err as a ui.ErrorMsg.

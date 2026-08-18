@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 )
@@ -125,7 +126,7 @@ func TestAppWindowSize(t *testing.T) {
 			}
 
 			active := stubs[tt.active]
-			wantScreen := dims{Width: tt.msg.Width, Height: tt.msg.Height - ChromeHeight}
+			wantScreen := dims{Width: tt.msg.Width, Height: ContentHeight(tt.msg.Height)}
 			if diff := cmp.Diff(wantScreen, dims{Width: active.width, Height: active.height}); diff != "" {
 				t.Errorf("active screen size mismatch (-want +got):\n%s", diff)
 			}
@@ -202,6 +203,52 @@ func TestAppScreenTransition(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestThemeChangePropagatesToEveryScreen(t *testing.T) {
+	app, stubs := newTestApp(t, ScreenHosts)
+	msg := ThemeChangedMsg{Primary: "#112233", Secondary: "#ffaa00"}
+	got, cmd := update(t, app, msg)
+	if cmd != nil {
+		t.Fatal("theme change emitted a command")
+	}
+	if got.ThemePrimary != msg.Primary || got.ThemeSecondary != msg.Secondary {
+		t.Fatalf("root palette = %q/%q", got.ThemePrimary, got.ThemeSecondary)
+	}
+	for i, stub := range stubs {
+		if len(stub.msgs) != 1 {
+			t.Fatalf("screen %d received %d theme messages, want 1", i, len(stub.msgs))
+		}
+		if _, ok := stub.msgs[0].(ThemeChangedMsg); !ok {
+			t.Fatalf("screen %d received %T, want ThemeChangedMsg", i, stub.msgs[0])
+		}
+	}
+}
+
+func TestVerticalLayoutUsesViewportPercentages(t *testing.T) {
+	layout := calculateVerticalLayout(40)
+	want := verticalLayout{top: 2, content: 30, error: 4, bottom: 4}
+	if layout != want {
+		t.Fatalf("vertical layout = %+v, want %+v", layout, want)
+	}
+	app, _ := newTestApp(t, ScreenBrowser)
+	app.Width, app.Height = 100, 40
+	if got := lipgloss.Height(app.View()); got != 40 {
+		t.Fatalf("App.View height = %d, want exactly 40", got)
+	}
+}
+
+func TestWrapErrorIsBounded(t *testing.T) {
+	got := wrapError("permission denied "+strings.Repeat("very-long-diagnostic ", 20), 24, 2)
+	lines := strings.Split(got, "\n")
+	if len(lines) > 2 {
+		t.Fatalf("wrapError produced %d lines, want at most 2:\n%s", len(lines), got)
+	}
+	for _, line := range lines {
+		if len([]rune(line)) > 25 { // width plus a possible ellipsis
+			t.Fatalf("wrapError line overruns its bound: %q", line)
+		}
 	}
 }
 

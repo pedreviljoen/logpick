@@ -267,12 +267,23 @@ func probeGNUFind(ctx context.Context, t transport.Transport) bool {
 		return false
 	}
 
+	// Stderr must be drained concurrently with stdout, but not awaited before
+	// Wait. Command's captured stderr reaches EOF only after Wait marks the
+	// capture complete; waiting for stderr first deadlocks every real SSH
+	// capability probe and leaves the TUI on "Scanning…" forever.
+	stderrDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, proc.Stderr)
+		close(stderrDone)
+	}()
+
 	_, _ = io.Copy(io.Discard, proc.Stdout)
-	_, _ = io.Copy(io.Discard, proc.Stderr)
 	_ = proc.Stdout.Close()
+	waitErr := proc.Wait()
+	<-stderrDone
 	_ = proc.Stderr.Close()
 
-	return proc.Wait() == nil
+	return waitErr == nil
 }
 
 // drainScan runs remote.ParseScan over proc.Stdout concurrently with

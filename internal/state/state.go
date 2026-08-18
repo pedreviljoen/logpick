@@ -23,6 +23,15 @@ import (
 type State struct {
 	Hosts   []Host  `toml:"hosts"`
 	Fetches []Fetch `toml:"fetches"`
+	Theme   Theme   `toml:"theme"`
+}
+
+// Theme is the tool-owned interactive palette. Keeping UI preferences in
+// state.toml preserves config.toml's read-only contract outside first run.
+type Theme struct {
+	Configured bool   `toml:"configured"`
+	Primary    string `toml:"primary"`
+	Secondary  string `toml:"secondary"`
 }
 
 // Host is one remembered host: how it is reached, how often and how recently
@@ -268,6 +277,18 @@ func (s *Store) writeState(st *State) error {
 	}
 
 	return nil
+}
+
+// SetTheme atomically persists the interactive palette.
+func (s *Store) SetTheme(primary, secondary string) error {
+	return s.withLock(func() error {
+		st, err := s.readState()
+		if err != nil {
+			return err
+		}
+		st.Theme = Theme{Configured: true, Primary: primary, Secondary: secondary}
+		return s.writeState(st)
+	})
 }
 
 // RecordConnect notes a successful connection to host at time at.

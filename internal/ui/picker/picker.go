@@ -88,9 +88,10 @@ type Model[T Item] struct {
 	// offset indexes into matches: the first row the viewport renders.
 	offset int
 
-	// height is the number of match rows the viewport renders, set by
-	// SetHeight. Zero means SetHeight has not been called.
+	// height and width bound the rendered match rows. Zero means the
+	// corresponding dimension has not been configured.
 	height int
+	width  int
 
 	// selectedIdx indexes into all: the item committed by the most recent
 	// enter on a non-empty match set. -1 means nothing has been committed
@@ -183,9 +184,9 @@ func clampView(cursor, matchLen, offset, height int) (int, int) {
 //
 // A tea.KeyMsg is handled as follows, and nothing else is inspected:
 //
-//   - ctrl+n moves the cursor to the next match, ctrl+p to the previous one.
-//     Both stop at the bounds of the current match set: ctrl+n at the last
-//     match, ctrl+p at the first, rather than wrapping. Moving the cursor
+//   - ctrl+n/down moves to the next match, ctrl+p/up to the previous one.
+//     Both stop at the bounds of the current match set rather than wrapping.
+//     Moving the cursor
 //     past the edge of the viewport set by SetHeight advances Offset by
 //     exactly enough to keep the cursor visible.
 //   - enter commits the item under the cursor: it becomes the value Selected
@@ -211,11 +212,11 @@ func (m Model[T]) Update(msg tea.Msg) (Model[T], tea.Cmd) {
 	}
 
 	switch keyMsg.Type {
-	case tea.KeyCtrlN:
+	case tea.KeyCtrlN, tea.KeyDown:
 		m.cursor, m.offset = clampView(m.cursor+1, len(m.matches), m.offset, m.height)
 		return m, nil
 
-	case tea.KeyCtrlP:
+	case tea.KeyCtrlP, tea.KeyUp:
 		m.cursor, m.offset = clampView(m.cursor-1, len(m.matches), m.offset, m.height)
 		return m, nil
 
@@ -264,8 +265,9 @@ func (m Model[T]) View() string {
 			b.WriteString("  ")
 		}
 
+		display := truncateRow(match.Str, m.width-2)
 		if len(match.MatchedIndexes) == 0 {
-			b.WriteString(match.Str)
+			b.WriteString(display)
 			b.WriteByte('\n')
 			continue
 		}
@@ -274,7 +276,7 @@ func (m Model[T]) View() string {
 		for _, idx := range match.MatchedIndexes {
 			highlighted[idx] = true
 		}
-		for j, r := range match.Str {
+		for j, r := range display {
 			if highlighted[j] {
 				b.WriteByte('[')
 				b.WriteRune(r)
@@ -299,6 +301,11 @@ func (m Model[T]) Selected() (T, bool) {
 		return zero, false
 	}
 	return m.all[m.selectedIdx], true
+}
+
+// Query returns the current text in the picker's filter input.
+func (m Model[T]) Query() string {
+	return m.input.Value()
 }
 
 // Matches returns the current match set, in the order View renders them:
@@ -337,6 +344,31 @@ func (m Model[T]) SetHeight(height int) Model[T] {
 	m.height = height
 	m.cursor, m.offset = clampView(m.cursor, len(m.matches), m.offset, height)
 	return m
+}
+
+// SetWidth bounds each rendered row and the filter input to width cells.
+func (m Model[T]) SetWidth(width int) Model[T] {
+	m.width = width
+	inputWidth := width - 2
+	if inputWidth < 1 {
+		inputWidth = 1
+	}
+	m.input.Width = inputWidth
+	return m
+}
+
+func truncateRow(value string, width int) string {
+	if width <= 0 {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width == 1 {
+		return "…"
+	}
+	return string(runes[:width-1]) + "…"
 }
 
 // SetCursor returns the updated model with Cursor set to i, never mutating

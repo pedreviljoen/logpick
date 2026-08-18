@@ -50,11 +50,14 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/pedreviljoen/logpick/internal/config"
 	"github.com/pedreviljoen/logpick/internal/local"
 	"github.com/pedreviljoen/logpick/internal/remote"
 	"github.com/pedreviljoen/logpick/internal/transport"
@@ -82,6 +85,91 @@ func testDeps(t *testing.T, host string) appDeps {
 		Host:      resolveDefault(t, host),
 		Now:       fixedClock(clock),
 	}
+}
+
+type previewRetryTransport struct {
+	calls []string
+}
+
+func (t *previewRetryTransport) Exec(_ context.Context, cmd string) (*transport.Process, error) {
+	t.calls = append(t.calls, cmd)
+	if len(t.calls) == 1 {
+		return &transport.Process{
+			Stdout: io.NopCloser(strings.NewReader("")),
+			Stderr: io.NopCloser(strings.NewReader("")),
+			Wait: func() error {
+				return &transport.ExitError{Code: 1, Stderr: "tail: Permission denied"}
+			},
+		}, nil
+	}
+	return &transport.Process{
+		Stdout: io.NopCloser(strings.NewReader("booted\nready\n")),
+		Stderr: io.NopCloser(strings.NewReader("")),
+		Wait:   func() error { return nil },
+	}, nil
+}
+
+func (t *previewRetryTransport) Fetch(context.Context, string, string, chan<- transport.Progress) (int64, error) {
+	return 0, transport.ErrNotSupported
+}
+func (t *previewRetryTransport) Caps() transport.Caps        { return transport.Caps{} }
+func (t *previewRetryTransport) Check(context.Context) error { return nil }
+func (t *previewRetryTransport) Close() error                { return nil }
+
+func TestPreviewRetriesPermissionDeniedWithSudo(t *testing.T) {
+	tp := &previewRetryTransport{}
+	preview := previewFunc(appDeps{Transport: tp})
+	lines, err := preview(context.Background(), "ec2-user@example.com", "/var/log/boot.log")
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if diff := cmp.Diff([]string{"booted", "ready"}, lines); diff != "" {
+		t.Fatalf("preview lines mismatch (-want +got):\n%s", diff)
+	}
+	wantCalls := []string{
+		"tail -n 100 '/var/log/boot.log'",
+		"sudo -n tail -n 100 '/var/log/boot.log'",
+	}
+	if diff := cmp.Diff(wantCalls, tp.calls); diff != "" {
+		t.Fatalf("preview commands mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestConnectionProbeError(t *testing.T) {
+	noisy := &transport.ExitError{Code: 255, Stderr: "very long ssh diagnostic"}
+	got := connectionProbeError(noisy)
+	if !errors.Is(got, transport.ErrAuthRequired) {
+		t.Fatalf("connectionProbeError = %v, want ErrAuthRequired", got)
+	}
+	if !strings.Contains(got.Error(), "ubuntu@host") || !strings.Contains(got.Error(), "ec2-user@host") {
+		t.Fatalf("connectionProbeError is not actionable: %v", got)
+	}
+	if strings.Contains(got.Error(), noisy.Stderr) {
+		t.Fatalf("connectionProbeError leaked noisy SSH stderr: %v", got)
+	}
+}
+
+func TestHistoryProfileOverrides(t *testing.T) {
+	t.Run("built-in default remains an implicit fallback", func(t *testing.T) {
+		resolved, err := config.Resolve(nil, "example-host", historyProfileOverrides(config.DefaultProfileName))
+		if err != nil {
+			t.Fatalf("Resolve with stored default profile: %v", err)
+		}
+		if resolved.ProfileName != config.DefaultProfileName {
+			t.Fatalf("profile = %q, want %q", resolved.ProfileName, config.DefaultProfileName)
+		}
+	})
+
+	t.Run("a named profile remains an explicit override", func(t *testing.T) {
+		cfg := &config.Config{Profiles: map[string]config.Profile{"corp": {}}}
+		resolved, err := config.Resolve(cfg, "example-host", historyProfileOverrides("corp"))
+		if err != nil {
+			t.Fatalf("Resolve with stored named profile: %v", err)
+		}
+		if resolved.ProfileName != "corp" {
+			t.Fatalf("profile = %q, want corp", resolved.ProfileName)
+		}
+	})
 }
 
 func TestNewApp(t *testing.T) {

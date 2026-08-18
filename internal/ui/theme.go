@@ -65,3 +65,22 @@ func DefaultTheme() Theme {
 		LineMatch: lipgloss.NewStyle().Bold(true).Foreground(match),
 	}
 }
+
+// WithColors applies user-configured palette colors to a base theme. Primary
+// drives titles, focused controls and active borders. Secondary drives warning
+// and match/highlight states. Empty values preserve the adaptive defaults.
+func (t Theme) WithColors(primary, secondary string) Theme {
+	if primary != "" {
+		color := lipgloss.Color(primary)
+		t.Title = t.Title.Foreground(color)
+		t.PaneActive = t.PaneActive.BorderForeground(color)
+		t.RowFocus = t.RowFocus.Foreground(color)
+	}
+	if secondary != "" {
+		color := lipgloss.Color(secondary)
+		t.Error = t.Error.Foreground(color)
+		t.Match = t.Match.Foreground(color)
+		t.LineMatch = t.LineMatch.Foreground(color)
+	}
+	return t
+}

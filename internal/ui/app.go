@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -45,10 +46,40 @@ func (s Screen) String() string {
 	}
 }
 
-// ChromeHeight is the number of terminal rows the root draws itself and so does
-// not give to the active screen: the title line and the status line, with the
-// error banner taking the place of the status line when one is set.
-const ChromeHeight = 2
+type verticalLayout struct {
+	top, content, error, bottom int
+}
+
+func calculateVerticalLayout(height int) verticalLayout {
+	if height <= 0 {
+		return verticalLayout{}
+	}
+	// The content starts 5% from the top and occupies 75% of the terminal.
+	// The error and bottom regions each receive the remaining 10%.
+	top := (height + 10) / 20
+	content := (height*3 + 2) / 4
+	errorHeight := (height + 5) / 10
+	if top > height {
+		top = height
+	}
+	if errorHeight > height-top {
+		errorHeight = height - top
+	}
+	if content > height-top-errorHeight {
+		content = height - top - errorHeight
+	}
+	return verticalLayout{
+		top:     top,
+		content: content,
+		error:   errorHeight,
+		bottom:  height - top - content - errorHeight,
+	}
+}
+
+// ContentHeight returns the 75% terminal-height region assigned to screens.
+func ContentHeight(height int) int {
+	return calculateVerticalLayout(height).content
+}
 
 // ScreenModel is what the root needs from a screen. Every screen package
 // implements it, and the root holds nothing else about them.
@@ -107,8 +138,11 @@ type App struct {
 	// Keys is the global key map. Screens carry their own bindings.
 	Keys KeyMap
 
-	// Theme is the style set the root and the screens render with.
-	Theme Theme
+	// Theme is the style set the root and screens render with. ThemePrimary and
+	// ThemeSecondary retain the palette values used to build it.
+	Theme          Theme
+	ThemePrimary   string
+	ThemeSecondary string
 }
 
 // New returns the root model with the four screen models installed and the
@@ -142,7 +176,7 @@ func (a App) Init() tea.Cmd { return a.Screens[a.Active].Init() }
 // The root owns four things, and none of them are forwarded to a screen:
 //
 //   - tea.WindowSizeMsg records the new dimensions and resizes the active
-//     screen to the terminal size less ChromeHeight rows. It emits no command.
+//     screen to the 75% content region. It emits no command.
 //   - ScreenTransitionMsg and BackMsg change the active screen. The screens that
 //     are not active are left exactly as they were. Neither emits a command.
 //   - ErrorMsg sets the error banner and ClearErrorMsg clears it. Neither
@@ -157,7 +191,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		a.Width = msg.Width
 		a.Height = msg.Height
-		a.Screens[a.Active] = a.Screens[a.Active].Resize(msg.Width, msg.Height-ChromeHeight)
+		a.Screens[a.Active] = a.Screens[a.Active].Resize(msg.Width, ContentHeight(msg.Height))
 		return a, nil
 
 	case ScreenTransitionMsg:
@@ -176,7 +210,25 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.Err = nil
 		return a, nil
 
+	case StatusMsg:
+		a.Status = msg.Text
+		return a, nil
+
+	case ThemeChangedMsg:
+		a.ThemePrimary = msg.Primary
+		a.ThemeSecondary = msg.Secondary
+		a.Theme = DefaultTheme().WithColors(msg.Primary, msg.Secondary)
+		for i, screen := range a.Screens {
+			updated, _ := screen.Update(msg)
+			a.Screens[i] = updated
+		}
+		return a, nil
+
 	case tea.KeyMsg:
+		if a.Err != nil && msg.Type == tea.KeyEsc {
+			a.Err = nil
+			return a, nil
+		}
 		switch {
 		case key.Matches(msg, a.Keys.Quit):
 			return a, tea.Quit
@@ -205,17 +257,79 @@ func backTarget(active Screen) Screen {
 	}
 }
 
-// View renders the chrome around the active screen: the title line, the active
-// screen, and either the error banner or the status line.
+// View renders the chrome around the active screen: the title line, the fixed
+// screen area, and either a bounded error box or the reserved status area.
 func (a App) View() string {
-	title := a.Theme.Title.Render(a.Active.String())
-
-	footer := a.Theme.Status.Render(a.Status)
-	if a.Err != nil {
-		footer = a.Theme.Error.Render(a.Err.Error())
+	height := a.Height
+	if height <= 0 {
+		height = 30
 	}
+	layout := calculateVerticalLayout(height)
+	title := a.Theme.Title.Render("logpick  /  " + a.Active.String())
+	top := lipgloss.NewStyle().Height(layout.top).AlignVertical(lipgloss.Bottom).Render(title)
+	screen := lipgloss.NewStyle().Height(layout.content).Render(a.Screens[a.Active].View())
 
-	return lipgloss.JoinVertical(lipgloss.Left, title, a.Screens[a.Active].View(), footer)
+	footer := lipgloss.NewStyle().Height(layout.error).Render(a.Theme.Status.Render(a.Status))
+	if a.Err != nil {
+		width := a.Width
+		if width <= 0 {
+			width = 80
+		}
+		if layout.error >= 3 {
+			contentWidth := max(8, width-4)
+			contentHeight := layout.error - 2
+			message := wrapError("Error: "+a.Err.Error()+"  (esc dismiss)", contentWidth, contentHeight)
+			footer = lipgloss.NewStyle().
+				Width(contentWidth).
+				Height(contentHeight).
+				Padding(0, 1).
+				Border(lipgloss.RoundedBorder()).
+				Render(a.Theme.Error.Render(message))
+		} else {
+			message := wrapError("Error: "+a.Err.Error(), max(1, width), max(1, layout.error))
+			footer = lipgloss.NewStyle().Height(layout.error).Render(a.Theme.Error.Render(message))
+		}
+	}
+	bottom := lipgloss.NewStyle().Height(layout.bottom).Render("")
+
+	return lipgloss.JoinVertical(lipgloss.Left, top, screen, footer, bottom)
+}
+
+func wrapError(message string, width, maxLines int) string {
+	words := strings.Fields(message)
+	if len(words) == 0 || width <= 0 || maxLines <= 0 {
+		return ""
+	}
+	lines := make([]string, 0, maxLines)
+	var current strings.Builder
+	for _, word := range words {
+		if current.Len() > 0 && current.Len()+1+len(word) > width {
+			lines = append(lines, current.String())
+			current.Reset()
+			if len(lines) == maxLines {
+				break
+			}
+		}
+		if current.Len() > 0 {
+			current.WriteByte(' ')
+		}
+		wordRunes := []rune(word)
+		if len(wordRunes) > width {
+			word = string(wordRunes[:max(1, width-1)]) + "…"
+		}
+		current.WriteString(word)
+	}
+	if len(lines) < maxLines && current.Len() > 0 {
+		lines = append(lines, current.String())
+	}
+	if len(lines) == maxLines && len(strings.Join(lines, " ")) < len(strings.Join(words, " ")) {
+		last := []rune(lines[len(lines)-1])
+		if len(last) >= width {
+			last = last[:max(1, width-1)]
+		}
+		lines[len(lines)-1] = strings.TrimSpace(string(last)) + "…"
+	}
+	return strings.Join(lines, "\n")
 }
 
 // WaitForLines returns a command that takes one batch off ch and reports it as

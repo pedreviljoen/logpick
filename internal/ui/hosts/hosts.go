@@ -14,6 +14,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/pedreviljoen/logpick/internal/config"
 	"github.com/pedreviljoen/logpick/internal/ui"
@@ -67,6 +68,22 @@ type ProbeFunc func(ctx context.Context, host string, exec []string) error
 // substitute a func that fails the test if it is ever called, which is
 // exactly how mechanic 2 proves nothing was written.
 type WriteFunc func(host, profileName string, profile config.Profile) error
+
+// ThemeSaveFunc persists the user-owned UI palette outside config.toml.
+type ThemeSaveFunc func(primary, secondary string) error
+
+// probeResultMsg returns a first-run probe result to the hosts model so it can
+// clear the pending state before forwarding a failure to the root error banner.
+type probeResultMsg struct {
+	host    string
+	profile string
+	err     error
+}
+
+type themeSavedMsg struct {
+	primary, secondary string
+	err                error
+}
 
 // hostItem adapts a ui.HostSummary to picker.Item so the history list can
 // be a picker.Model[hostItem]. FilterValue is the host's Label when it has
@@ -123,6 +140,25 @@ func WithWriter(fn WriteFunc) Option {
 	}
 }
 
+// WithTheme applies the application's configured palette to the host picker
+// and connection form.
+func WithTheme(theme ui.Theme) Option {
+	return func(m *Model) { m.theme = theme }
+}
+
+// WithPalette seeds the theme editor with the active hex values.
+func WithPalette(primary, secondary string) Option {
+	return func(m *Model) {
+		m.palettePrimary = primary
+		m.paletteSecondary = secondary
+	}
+}
+
+// WithThemeSaver configures persistence for the interactive theme editor.
+func WithThemeSaver(fn ThemeSaveFunc) Option {
+	return func(m *Model) { m.themeSaveFn = fn }
+}
+
 // Model is the hosts screen: the fuzzy list of host history and the
 // first-run flow for a host that history and config.toml both know nothing
 // about (DESIGN.md 9.1). It implements ui.ScreenModel.
@@ -138,36 +174,30 @@ func WithWriter(fn WriteFunc) Option {
 //
 // # The first-run flow
 //
-// ctrl+n opens a text field for a hostname that is not in history. On
-// enter, Update resolves that hostname against cfg the same way
-// config.Resolve does: it checks cfg.Hosts for an exact [host.<name>]
-// entry and cfg.Matches, in file order, for the first [[match]] rule whose
-// Host pattern matches (config.Resolve's own path.Match semantics).
+// With no host history, the connection form opens automatically; ctrl+n opens
+// it later. The form captures host, optional identity file and command template.
+// On enter, Update resolves the hostname against cfg the same way config.Resolve
+// does: it checks cfg.Hosts for an exact [host.<name>] entry and cfg.Matches, in
+// file order, for the first matching rule.
 //
 //   - If either exists, the host already has a routing rule and Update
 //     takes the same no-probe path as an existing history row: it calls
 //     config.Resolve(cfg, host, config.Overrides{}) for the resolved
 //     profile name and reports ui.HostSelectedMsg immediately (mechanic 1
 //     for a host with no history yet).
-//   - If neither exists, this is a genuinely new host. Update remembers it
-//     as pending and returns a tea.Cmd that calls ProbeFunc with
-//     config.DefaultProfile.Exec, the only exec template T18's first-run
-//     flow offers: there is no form for a custom one. A probe failure
-//     reports ui.ErrorMsg and touches config.toml not at all (mechanic 2).
-//     A probe success reports ui.ConnectedMsg{Host, Profile: host}, reusing
-//     the message exactly as its own doc comment describes: "also the
-//     success signal of the first-run probe".
+//   - If neither exists, this is a genuinely new host. Update builds an argv
+//     template from the form, remembers the complete profile as pending, and
+//     returns a tea.Cmd that calls ProbeFunc. A probe failure reopens the form,
+//     reports ui.ErrorMsg and touches config.toml not at all. A probe success
+//     advances to the config write.
 //
-// Because ui.ConnectedMsg is only ever routed to Model while Model is still
-// the active screen, and the root only ever makes Model inactive in
-// response to Model itself sending ui.HostSelectedMsg (which the first-run
-// path has not sent yet at this point), every ui.ConnectedMsg Update
-// receives belongs to a probe it issued. Update checks it against the
-// pending host it recorded, clears the pending state, and returns a
-// tea.Cmd that calls WriteFunc with the pending host, the pending host's
-// name again as the profile name, and config.DefaultProfile - an exec
-// template and a scan spec, nothing else (invariant 3: never write
-// credentials). A write failure reports ui.ErrorMsg. A write success
+// The private probe result message returns to Model while it is still active.
+// Model checks it against the pending host, clears the pending state, and on
+// success returns a tea.Cmd
+// that calls WriteFunc with the pending host, the host name as profile name,
+// and the form-built profile. The identity file path may be stored in Exec,
+// but key contents are never read into or written to config. A write failure
+// reports ui.ErrorMsg. A write success
 // reports ui.HostSelectedMsg{Host, Profile: host} (mechanic 3), which is
 // the point the root moves to the browser and starts the real connection.
 //
@@ -187,6 +217,9 @@ func WithWriter(fn WriteFunc) Option {
 //
 // The zero value is not useful. Use New.
 type Model struct {
+	// theme styles focus, borders, guidance and warnings.
+	theme ui.Theme
+
 	// cfg is the parsed config.toml. Resolving a hostname against it is a
 	// pure, in-memory operation (config.Resolve does no I/O), so Model
 	// holds it directly rather than through an injected func.
@@ -194,11 +227,12 @@ type Model struct {
 
 	// listFn, removeFn, pinFn, probeFn, writeFn are the injected
 	// collaborators. See their type doc comments.
-	listFn   ListFunc
-	removeFn RemoveFunc
-	pinFn    PinFunc
-	probeFn  ProbeFunc
-	writeFn  WriteFunc
+	listFn      ListFunc
+	removeFn    RemoveFunc
+	pinFn       PinFunc
+	probeFn     ProbeFunc
+	writeFn     WriteFunc
+	themeSaveFn ThemeSaveFunc
 
 	// hosts is the current history, already in display order: pinned
 	// first, then by most recently seen (DESIGN.md 9.1). It backs list and
@@ -208,14 +242,27 @@ type Model struct {
 	// list is the fuzzy picker over hosts, adapted through hostItem.
 	list picker.Model[hostItem]
 
-	// defining reports whether the ctrl+n text field for a new hostname is
-	// open. While true, tea.KeyMsg values that are not enter or esc go to
-	// input rather than to list.
+	// defining reports whether the new-connection form is open. It opens
+	// automatically on first run and via ctrl+n when history exists.
 	defining bool
 
-	// input is the text field for a new hostname, live only while defining
-	// is true.
-	input textinput.Model
+	// The connection form captures enough information to create a usable
+	// command profile instead of assuming unauthenticated ssh.
+	input         textinput.Model
+	identityInput textinput.Model
+	commandInput  textinput.Model
+	formFocus     int
+
+	// Theme editor state. Changes preview live through ui.ThemeChangedMsg and
+	// are persisted only when Enter commits them.
+	theming                bool
+	themeFocus             int
+	themePrimaryInput      textinput.Model
+	themeSecondaryInput    textinput.Model
+	palettePrimary         string
+	paletteSecondary       string
+	themeOriginalPrimary   string
+	themeOriginalSecondary string
 
 	// hasPending, pendingHost and pendingProfileName track a first-run
 	// probe issued but not yet answered: the host name that was probed and
@@ -226,6 +273,7 @@ type Model struct {
 	hasPending         bool
 	pendingHost        string
 	pendingProfileName string
+	pendingProfile     config.Profile
 
 	// width and height are the last dimensions Resize was called with.
 	width  int
@@ -239,10 +287,10 @@ type Model struct {
 // matching With* option fails loudly instead of silently no-oping the
 // action it backs.
 func New(cfg *config.Config, list ListFunc, opts ...Option) Model {
-	input := textinput.New()
-	input.Placeholder = "hostname"
+	input, identityInput, commandInput := newConnectionInputs()
 
 	m := Model{
+		theme:  ui.DefaultTheme(),
 		cfg:    cfg,
 		listFn: list,
 		removeFn: func(host string) error {
@@ -257,13 +305,20 @@ func New(cfg *config.Config, list ListFunc, opts ...Option) Model {
 		writeFn: func(host, profileName string, profile config.Profile) error {
 			return fmt.Errorf("hosts: no WriteFunc configured (use WithWriter); cannot write profile %q for host %q", profileName, host)
 		},
-		list:  picker.New[hostItem](nil),
-		input: input,
+		themeSaveFn: func(primary, secondary string) error {
+			return fmt.Errorf("hosts: no ThemeSaveFunc configured; cannot save palette %q/%q", primary, secondary)
+		},
+		list:          picker.New[hostItem](nil),
+		input:         input,
+		identityInput: identityInput,
+		commandInput:  commandInput,
 	}
 
 	for _, opt := range opts {
 		opt(&m)
 	}
+	m.themeOriginalPrimary = m.palettePrimary
+	m.themeOriginalSecondary = m.paletteSecondary
 
 	return m
 }
@@ -339,6 +394,9 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		next := m
 		next.hosts = hosts
 		next.list = buildList(hosts)
+		if len(hosts) == 0 {
+			next = next.openConnectionForm()
+		}
 		return next, nil
 
 	case ui.HostRemovedMsg:
@@ -367,6 +425,28 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		next.list = buildList(hosts)
 		return next, nil
 
+	case ui.ThemeChangedMsg:
+		next := m
+		next.theme = ui.DefaultTheme().WithColors(msg.Primary, msg.Secondary)
+		next.palettePrimary = msg.Primary
+		next.paletteSecondary = msg.Secondary
+		return next, nil
+
+	case themeSavedMsg:
+		next := m
+		if msg.err != nil {
+			return next, func() tea.Msg { return ui.ErrorMsg{Err: fmt.Errorf("saving theme: %w", msg.err)} }
+		}
+		next.theming = false
+		next.palettePrimary = msg.primary
+		next.paletteSecondary = msg.secondary
+		next.themeOriginalPrimary = msg.primary
+		next.themeOriginalSecondary = msg.secondary
+		return next, func() tea.Msg { return ui.StatusMsg{Text: "theme saved"} }
+
+	case probeResultMsg:
+		return m.handleProbeResult(msg)
+
 	case ui.ConnectedMsg:
 		return m.handleConnected(msg)
 
@@ -376,6 +456,24 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 	default:
 		return m, nil
 	}
+}
+
+func (m Model) handleProbeResult(msg probeResultMsg) (ui.ScreenModel, tea.Cmd) {
+	if !m.hasPending || msg.host != m.pendingHost {
+		return m, nil
+	}
+	if msg.err == nil {
+		return m.handleConnected(ui.ConnectedMsg{Host: msg.host, Profile: msg.profile})
+	}
+
+	next := m
+	next.hasPending = false
+	next.defining = true
+	next = next.focusFormField(m.formFocus)
+	cmd := func() tea.Msg {
+		return ui.ErrorMsg{Err: fmt.Errorf("probing host %q: %w", msg.host, msg.err)}
+	}
+	return next, cmd
 }
 
 // handleConnected drives the second half of the first-run flow: it ignores
@@ -393,10 +491,12 @@ func (m Model) handleConnected(msg ui.ConnectedMsg) (ui.ScreenModel, tea.Cmd) {
 	host := m.pendingHost
 	profileName := m.pendingProfileName
 	writeFn := m.writeFn
-	profile := config.DefaultProfile
+	profile := m.pendingProfile
 
 	next.pendingHost = ""
 	next.pendingProfileName = ""
+	next.pendingProfile = config.Profile{}
+	next.defining = false
 
 	cmd := func() tea.Msg {
 		if err := writeFn(host, profileName, profile); err != nil {
@@ -411,7 +511,35 @@ func (m Model) handleConnected(msg ui.ConnectedMsg) (ui.ScreenModel, tea.Cmd) {
 // enter as documented on Model, and forwarding every other key to input
 // while defining is true, or to the picker otherwise.
 func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
+	if m.theming {
+		return m.handleThemeKey(msg)
+	}
+	if m.hasPending {
+		return m, nil
+	}
+
+	if m.defining {
+		switch msg.Type {
+		case tea.KeyEsc:
+			next := m
+			next.defining = false
+			return next, nil
+		case tea.KeyTab, tea.KeyDown:
+			next := m.focusFormField((m.formFocus + 1) % 3)
+			return next, nil
+		case tea.KeyShiftTab, tea.KeyUp:
+			next := m.focusFormField((m.formFocus + 2) % 3)
+			return next, nil
+		case tea.KeyEnter:
+			return m.handleEnterDefining()
+		}
+		return m.updateFormInput(msg)
+	}
+
 	switch msg.Type {
+	case tea.KeyCtrlT:
+		next := m.openThemeEditor()
+		return next, nil
 	case tea.KeyCtrlD:
 		return m.handleDelete()
 	case tea.KeyCtrlP:
@@ -420,20 +548,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
 		return m.handleCtrlN()
 	case tea.KeyEnter:
 		return m.handleEnter()
-	case tea.KeyEsc:
-		if m.defining {
-			next := m
-			next.defining = false
-			next.input = newHostInput()
-			return next, nil
-		}
-	}
-
-	if m.defining {
-		next := m
-		var cmd tea.Cmd
-		next.input, cmd = next.input.Update(msg)
-		return next, cmd
 	}
 
 	next := m
@@ -442,12 +556,150 @@ func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
 	return next, cmd
 }
 
-// newHostInput returns a fresh, focused text field for a new hostname.
-func newHostInput() textinput.Model {
+func newConnectionInputs() (textinput.Model, textinput.Model, textinput.Model) {
+	host := textinput.New()
+	host.Prompt = ""
+	host.Placeholder = "ec2-user@example.com"
+	host.Focus()
+
+	identity := textinput.New()
+	identity.Prompt = ""
+	identity.Placeholder = "optional — leave blank to use SSH agent/config"
+	identity.Blur()
+
+	command := textinput.New()
+	command.Prompt = ""
+	command.Placeholder = "ssh"
+	command.Blur()
+	return host, identity, command
+}
+
+func (m Model) openConnectionForm() Model {
+	host, identity, command := newConnectionInputs()
+	m.defining = true
+	m.input = host
+	m.identityInput = identity
+	m.commandInput = command
+	m.formFocus = 0
+	return m
+}
+
+func (m Model) focusFormField(field int) Model {
+	m.input.Blur()
+	m.identityInput.Blur()
+	m.commandInput.Blur()
+	m.formFocus = field
+	switch field {
+	case 0:
+		m.input.Focus()
+	case 1:
+		m.identityInput.Focus()
+	case 2:
+		m.commandInput.Focus()
+	}
+	return m
+}
+
+func (m Model) updateFormInput(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
+	var cmd tea.Cmd
+	switch m.formFocus {
+	case 0:
+		m.input, cmd = m.input.Update(msg)
+	case 1:
+		m.identityInput, cmd = m.identityInput.Update(msg)
+	case 2:
+		m.commandInput, cmd = m.commandInput.Update(msg)
+	}
+	return m, cmd
+}
+
+func newThemeInput(value, placeholder string) textinput.Model {
 	input := textinput.New()
-	input.Placeholder = "hostname"
-	input.Focus()
+	input.Prompt = ""
+	input.Placeholder = placeholder
+	input.SetValue(value)
+	input.CharLimit = 7
 	return input
+}
+
+func (m Model) openThemeEditor() Model {
+	m.theming = true
+	m.themeFocus = 0
+	m.themeOriginalPrimary = m.palettePrimary
+	m.themeOriginalSecondary = m.paletteSecondary
+	m.themePrimaryInput = newThemeInput(m.palettePrimary, "#7aa2f7")
+	m.themeSecondaryInput = newThemeInput(m.paletteSecondary, "#e0af68")
+	m.themePrimaryInput.Focus()
+	m.themeSecondaryInput.Blur()
+	return m
+}
+
+func (m Model) focusThemeField(field int) Model {
+	m.themePrimaryInput.Blur()
+	m.themeSecondaryInput.Blur()
+	m.themeFocus = field
+	if field == 0 {
+		m.themePrimaryInput.Focus()
+	} else {
+		m.themeSecondaryInput.Focus()
+	}
+	return m
+}
+
+func validHexColor(value string) bool {
+	if value == "" {
+		return true
+	}
+	if len(value) != 7 || value[0] != '#' {
+		return false
+	}
+	_, err := strconv.ParseUint(value[1:], 16, 24)
+	return err == nil
+}
+
+func (m Model) handleThemeKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		next := m
+		next.theming = false
+		next.palettePrimary = m.themeOriginalPrimary
+		next.paletteSecondary = m.themeOriginalSecondary
+		return next, func() tea.Msg {
+			return ui.ThemeChangedMsg{Primary: m.themeOriginalPrimary, Secondary: m.themeOriginalSecondary}
+		}
+	case tea.KeyTab, tea.KeyDown, tea.KeyShiftTab, tea.KeyUp:
+		next := m.focusThemeField((m.themeFocus + 1) % 2)
+		return next, nil
+	case tea.KeyEnter:
+		primary := m.themePrimaryInput.Value()
+		secondary := m.themeSecondaryInput.Value()
+		if !validHexColor(primary) || !validHexColor(secondary) {
+			return m, func() tea.Msg {
+				return ui.ErrorMsg{Err: errors.New("theme colors must be empty or use #RRGGBB hex values")}
+			}
+		}
+		save := m.themeSaveFn
+		return m, func() tea.Msg {
+			return themeSavedMsg{primary: primary, secondary: secondary, err: save(primary, secondary)}
+		}
+	}
+
+	next := m
+	var inputCmd tea.Cmd
+	if next.themeFocus == 0 {
+		next.themePrimaryInput, inputCmd = next.themePrimaryInput.Update(msg)
+	} else {
+		next.themeSecondaryInput, inputCmd = next.themeSecondaryInput.Update(msg)
+	}
+	primary := next.themePrimaryInput.Value()
+	secondary := next.themeSecondaryInput.Value()
+	if !validHexColor(primary) || !validHexColor(secondary) {
+		return next, inputCmd
+	}
+	next.palettePrimary = primary
+	next.paletteSecondary = secondary
+	next.theme = ui.DefaultTheme().WithColors(primary, secondary)
+	return next, func() tea.Msg { return ui.ThemeChangedMsg{Primary: primary, Secondary: secondary} }
 }
 
 // highlighted returns the host currently under the picker's cursor, and
@@ -507,15 +759,12 @@ func (m Model) handlePin() (ui.ScreenModel, tea.Cmd) {
 	return m, cmd
 }
 
-// handleCtrlN opens the new-hostname text field (ctrl+n). It is a no-op
-// while already defining.
+// handleCtrlN opens the new-connection form. It is a no-op while open.
 func (m Model) handleCtrlN() (ui.ScreenModel, tea.Cmd) {
 	if m.defining {
 		return m, nil
 	}
-	next := m
-	next.defining = true
-	next.input = newHostInput()
+	next := m.openConnectionForm()
 	return next, nil
 }
 
@@ -531,7 +780,14 @@ func (m Model) handleEnter() (ui.ScreenModel, tea.Cmd) {
 
 	h, ok := m.highlighted()
 	if !ok {
-		return m, nil
+		// The picker input doubles as the first-run hostname field when there
+		// are no matching history rows. Enter should commit that visible value,
+		// not silently do nothing.
+		host := strings.TrimSpace(m.list.Query())
+		if host == "" {
+			return m, nil
+		}
+		return m.connectNewHost(host, config.DefaultProfile)
 	}
 
 	host := h.Name
@@ -548,21 +804,28 @@ func (m Model) handleEnter() (ui.ScreenModel, tea.Cmd) {
 // probe (mechanic 2), per Model's "The first-run flow" doc section.
 func (m Model) handleEnterDefining() (ui.ScreenModel, tea.Cmd) {
 	host := strings.TrimSpace(m.input.Value())
-
-	next := m
-	next.defining = false
-	next.input = newHostInput()
-
 	if host == "" {
-		return next, nil
+		return m, func() tea.Msg {
+			return ui.ErrorMsg{Err: errors.New("host is required (use user@hostname when the remote user differs)")}
+		}
 	}
 
+	profile, err := firstRunProfile(m.commandInput.Value(), m.identityInput.Value())
+	if err != nil {
+		return m, func() tea.Msg { return ui.ErrorMsg{Err: err} }
+	}
+	return m.connectNewHost(host, profile)
+}
+
+// connectNewHost resolves a hostname that is not an existing picker row and
+// either selects it immediately or starts the first-run liveness probe.
+func (m Model) connectNewHost(host string, profile config.Profile) (ui.ScreenModel, tea.Cmd) {
 	hasRule, err := hostHasRule(m.cfg, host)
 	if err != nil {
 		cmd := func() tea.Msg {
 			return ui.ErrorMsg{Err: fmt.Errorf("resolving host %q: %w", host, err)}
 		}
-		return next, cmd
+		return m, cmd
 	}
 
 	if hasRule {
@@ -571,28 +834,175 @@ func (m Model) handleEnterDefining() (ui.ScreenModel, tea.Cmd) {
 			cmd := func() tea.Msg {
 				return ui.ErrorMsg{Err: fmt.Errorf("resolving host %q: %w", host, err)}
 			}
-			return next, cmd
+			return m, cmd
 		}
 		profileName := resolved.ProfileName
 		cmd := func() tea.Msg {
 			return ui.HostSelectedMsg{Host: host, Profile: profileName}
 		}
-		return next, cmd
+		return m, cmd
 	}
 
+	next := m
 	next.hasPending = true
 	next.pendingHost = host
 	next.pendingProfileName = host
+	next.pendingProfile = profile
 
 	probeFn := m.probeFn
-	exec := config.DefaultProfile.Exec
+	exec := append([]string(nil), profile.Exec...)
 	cmd := func() tea.Msg {
-		if err := probeFn(context.Background(), host, exec); err != nil {
-			return ui.ErrorMsg{Err: fmt.Errorf("probing host %q: %w", host, err)}
+		return probeResultMsg{
+			host:    host,
+			profile: host,
+			err:     probeFn(context.Background(), host, exec),
 		}
-		return ui.ConnectedMsg{Host: host, Profile: host}
 	}
 	return next, cmd
+}
+
+func firstRunProfile(command, identity string) (config.Profile, error) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		command = "ssh"
+	}
+	argv, err := splitCommandLine(command)
+	if err != nil {
+		return config.Profile{}, fmt.Errorf("invalid command: %w", err)
+	}
+	if len(argv) == 0 {
+		return config.Profile{}, errors.New("command is required")
+	}
+
+	identity = strings.TrimSpace(identity)
+	if identity != "" {
+		identity, err = expandIdentityPath(identity)
+		if err != nil {
+			return config.Profile{}, err
+		}
+		insertAt := len(argv)
+		for i, arg := range argv {
+			if strings.Contains(arg, "{host}") {
+				insertAt = i
+				break
+			}
+		}
+		withIdentity := make([]string, 0, len(argv)+2)
+		withIdentity = append(withIdentity, argv[:insertAt]...)
+		withIdentity = append(withIdentity, "-i", identity)
+		withIdentity = append(withIdentity, argv[insertAt:]...)
+		argv = withIdentity
+	}
+
+	if !containsTemplate(argv, "{host}") {
+		argv = append(argv, "{host}")
+	}
+	if !containsTemplate(argv, "{cmd}") {
+		argv = append(argv, "--", "{cmd}")
+	}
+
+	profile := config.DefaultProfile
+	profile.Exec = argv
+	return profile, nil
+}
+
+func containsTemplate(argv []string, placeholder string) bool {
+	for _, arg := range argv {
+		if strings.Contains(arg, placeholder) {
+			return true
+		}
+	}
+	return false
+}
+
+func expandIdentityPath(path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("expanding identity file %q: %w", path, err)
+		}
+		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolving identity file %q: %w", path, err)
+	}
+	info, err := os.Stat(absolute)
+	if err != nil {
+		return "", fmt.Errorf("identity file %q: %w", absolute, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("identity file %q is not a regular file", absolute)
+	}
+	if permissions := info.Mode().Perm(); permissions&0o077 != 0 {
+		return "", fmt.Errorf(
+			"identity file %q has permissions %04o; SSH requires a private key mode such as 0600 (run: chmod 600 %s)",
+			absolute,
+			permissions,
+			strconv.Quote(absolute),
+		)
+	}
+	return absolute, nil
+}
+
+// splitCommandLine parses a command template into argv without invoking a
+// shell. It supports whitespace, single/double quotes and backslash escapes.
+func splitCommandLine(input string) ([]string, error) {
+	var (
+		argv    []string
+		word    strings.Builder
+		quote   rune
+		escaped bool
+		started bool
+	)
+	flush := func() {
+		if started {
+			argv = append(argv, word.String())
+			word.Reset()
+			started = false
+		}
+	}
+
+	for _, r := range input {
+		if escaped {
+			word.WriteRune(r)
+			started = true
+			escaped = false
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			escaped = true
+			started = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				word.WriteRune(r)
+			}
+			started = true
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			quote = r
+			started = true
+		case ' ', '\t', '\n':
+			flush()
+		default:
+			word.WriteRune(r)
+			started = true
+		}
+	}
+	if escaped {
+		return nil, errors.New("trailing escape")
+	}
+	if quote != 0 {
+		return nil, errors.New("unterminated quote")
+	}
+	flush()
+	return argv, nil
 }
 
 // hostHasRule reports whether cfg already routes host: an exact
@@ -619,13 +1029,122 @@ func hostHasRule(cfg *config.Config, host string) (bool, error) {
 	return false, nil
 }
 
-// View renders the query field, the sorted, filtered history list, and,
-// while defining, the new-hostname field in place of the list.
+// View renders either the connection form or the saved-host picker as a
+// bordered panel with its controls visible.
 func (m Model) View() string {
-	if m.defining {
-		return m.input.View() + "\n"
+	if m.theming {
+		return m.themeEditorView()
 	}
-	return m.list.View()
+	if m.defining {
+		return m.connectionFormView()
+	}
+
+	body := m.list.View()
+	if len(m.hosts) == 0 {
+		body += m.theme.Dim.Render("No saved hosts. Press ctrl+n to configure a connection.") + "\n"
+	} else {
+		body += m.theme.Dim.Render("enter connect  •  ctrl+n new  •  ctrl+t theme  •  ctrl+p pin  •  ctrl+d delete") + "\n"
+	}
+	return hostPanelStyle(m.width, m.theme).Render(body)
+}
+
+func (m Model) themeEditorView() string {
+	var b strings.Builder
+	b.WriteString(m.theme.Title.Render("◆ Theme"))
+	b.WriteString("\n")
+	b.WriteString(m.theme.Dim.Render("Enter hex colors and watch this preview update live."))
+	b.WriteString("\n\n")
+	b.WriteString(renderFormField("Primary — titles, active borders, focus", m.themePrimaryInput, m.themeFocus == 0, m.theme))
+	b.WriteString(renderFormField("Secondary — warnings, matches, highlights", m.themeSecondaryInput, m.themeFocus == 1, m.theme))
+
+	previewWidth := m.width - 16
+	if previewWidth > 56 {
+		previewWidth = 56
+	}
+	if previewWidth < 24 {
+		previewWidth = 24
+	}
+	preview := m.theme.PaneActive.
+		Width(previewWidth).
+		Padding(0, 1).
+		Render(
+			m.theme.Title.Render("Live preview") + "\n" +
+				m.theme.Row.Render("normal log line") + "\n" +
+				m.theme.Match.Render("highlighted match") + "\n" +
+				m.theme.Error.Render("warning state"),
+		)
+	b.WriteString(preview)
+	b.WriteString("\n\n")
+	if !validHexColor(m.themePrimaryInput.Value()) || !validHexColor(m.themeSecondaryInput.Value()) {
+		b.WriteString(m.theme.Error.Render("Use #RRGGBB values (or leave blank for defaults)."))
+		b.WriteByte('\n')
+	}
+	b.WriteString(m.theme.Dim.Render("Tab move  •  Enter save  •  Esc cancel"))
+	b.WriteByte('\n')
+	return hostPanelStyle(m.width, m.theme).Render(b.String())
+}
+
+func (m Model) connectionFormView() string {
+	var b strings.Builder
+	b.WriteString(m.theme.Title.Render("◆ New connection"))
+	b.WriteByte('\n')
+	b.WriteString(m.theme.Dim.Render("Configure the command used to reach the remote host."))
+	b.WriteByte('\n')
+	b.WriteString(m.theme.Dim.Render("For EC2, include the AMI user (often ubuntu@host or ec2-user@host)."))
+	b.WriteString("\n\n")
+	b.WriteString(renderFormField("Host (user@hostname)", m.input, m.formFocus == 0, m.theme))
+	b.WriteString(renderFormField("Identity file (-i) — optional; leave blank for SSH agent/config", m.identityInput, m.formFocus == 1, m.theme))
+	b.WriteString(renderFormField("Command", m.commandInput, m.formFocus == 2, m.theme))
+	if m.hasPending {
+		b.WriteByte('\n')
+		b.WriteString(m.theme.Match.Render("● Connecting to " + m.pendingHost + "…"))
+		b.WriteByte('\n')
+	} else {
+		b.WriteByte('\n')
+		b.WriteString(m.theme.Dim.Render("Tab/Shift+Tab move  •  Enter connect  •  Esc cancel  •  Ctrl+C quit"))
+		b.WriteByte('\n')
+		b.WriteString(m.theme.Dim.Render("Command defaults to ssh. Include {host} and {cmd} for custom templates."))
+		b.WriteByte('\n')
+	}
+	return hostPanelStyle(m.width, m.theme).Render(b.String())
+}
+
+func renderFormField(label string, input textinput.Model, active bool, theme ui.Theme) string {
+	marker := "  "
+	style := theme.PaneInactive
+	labelStyle := theme.Row
+	if active {
+		marker = "› "
+		style = theme.PaneActive
+		labelStyle = theme.RowFocus
+	}
+	width := input.Width
+	if width <= 0 {
+		width = 60
+	}
+	field := style.
+		Width(width).
+		Padding(0, 1).
+		Border(lipgloss.NormalBorder()).
+		Render(input.View())
+	return fmt.Sprintf("%s%s\n%s\n\n", marker, labelStyle.Render(label), field)
+}
+
+func hostPanelStyle(width int, theme ui.Theme) lipgloss.Style {
+	if width <= 0 {
+		width = 78
+	}
+	width -= 4
+	if width > 88 {
+		width = 88
+	}
+	if width < 32 {
+		width = 32
+	}
+	return theme.PaneActive.
+		Width(width).
+		Padding(1, 2).
+		Border(lipgloss.RoundedBorder())
 }
 
 // Resize records the area the screen has to render into and returns the
@@ -634,7 +1153,23 @@ func (m Model) Resize(width, height int) ui.ScreenModel {
 	next := m
 	next.width = width
 	next.height = height
-	next.list = next.list.SetHeight(height)
+	listHeight := height - 5
+	if listHeight < 1 {
+		listHeight = 1
+	}
+	next.list = next.list.SetHeight(listHeight).SetWidth(width - 8)
+	inputWidth := width - 12
+	if inputWidth > 76 {
+		inputWidth = 76
+	}
+	if inputWidth < 12 {
+		inputWidth = 12
+	}
+	next.input.Width = inputWidth
+	next.identityInput.Width = inputWidth
+	next.commandInput.Width = inputWidth
+	next.themePrimaryInput.Width = inputWidth
+	next.themeSecondaryInput.Width = inputWidth
 	return next
 }
 
@@ -643,6 +1178,16 @@ func (m Model) Resize(width, height int) ui.ScreenModel {
 // Model; a caller must not mutate it.
 func (m Model) Hosts() []ui.HostSummary {
 	return m.hosts
+}
+
+// Theming reports whether the live theme editor is open.
+func (m Model) Theming() bool {
+	return m.theming
+}
+
+// Palette returns the active primary and secondary color values.
+func (m Model) Palette() (string, string) {
+	return m.palettePrimary, m.paletteSecondary
 }
 
 // ApplyFirstRun returns config.toml's bytes for existing with a new
@@ -780,9 +1325,10 @@ func readExistingConfig(path string) ([]byte, error) {
 	return data, nil
 }
 
-// writeFileAtomic writes data to path atomically: a temp file created in
-// the same directory as path, written, fsynced, then renamed over path,
-// exactly as internal/state's own writes do (AGENTS.md section 3 invariant
+// writeFileAtomic creates path's parent directory with user-only permissions,
+// then writes data atomically: a temp file created in the same directory as
+// path, written, fsynced, then renamed over path, exactly as internal/state's
+// own writes do (AGENTS.md section 3 invariant
 // 5). Creating the temp file in path's own directory rather than, say,
 // os.TempDir matters: Rename is only atomic within one filesystem, and a
 // temp file on a different mount could not be renamed atomically at all on
@@ -794,6 +1340,9 @@ func readExistingConfig(path string) ([]byte, error) {
 // behind.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) (err error) {
 	dir := filepath.Dir(path)
+	if mkdirErr := os.MkdirAll(dir, 0o700); mkdirErr != nil {
+		return fmt.Errorf("creating config directory %s: %w", dir, mkdirErr)
+	}
 
 	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
 	if err != nil {

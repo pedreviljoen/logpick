@@ -2,11 +2,15 @@ package browser
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/pedreviljoen/logpick/internal/ui"
 	"github.com/pedreviljoen/logpick/internal/ui/picker"
@@ -50,6 +54,14 @@ func (i entryItem) FilterValue() string { return i.Entry.Path }
 // the root to execute, it does not hold the means to perform I/O itself.
 type PreviewFunc func(ctx context.Context, host, path string) ([]string, error)
 
+// SelectFunc fetches a remote log to a local snapshot and returns its local
+// path and full contents. Space invokes it; search always targets this local
+// snapshot rather than repeatedly streaming the remote file.
+type SelectFunc func(ctx context.Context, host string, entry ui.ScanEntry) (local string, lines []string, err error)
+
+// SearchFunc searches a selected local snapshot.
+type SearchFunc func(ctx context.Context, path, query string, regex bool) ([]ui.SearchMatch, error)
+
 // ContextFunc builds the context a single in-flight preview request runs
 // under, and the CancelFunc that stops it early when the selection moves
 // on. New's default is a plain context.WithCancel(context.Background()),
@@ -79,6 +91,35 @@ func WithDebounce(d time.Duration) Option {
 	return func(m *Model) {
 		m.debounce = d
 	}
+}
+
+// WithSelector configures the local snapshot fetch used by Space.
+func WithSelector(fn SelectFunc) Option {
+	return func(m *Model) { m.selectLog = fn }
+}
+
+// WithSearch configures search over a selected local snapshot.
+func WithSearch(fn SearchFunc) Option {
+	return func(m *Model) { m.search = fn }
+}
+
+// WithTheme applies the configured interactive palette.
+func WithTheme(theme ui.Theme) Option {
+	return func(m *Model) { m.theme = theme }
+}
+
+type logSelectedMsg struct {
+	host, remote, local string
+	lines               []string
+	err                 error
+}
+
+type browserSearchResultsMsg struct {
+	local   string
+	query   string
+	gen     uint64
+	matches []ui.SearchMatch
+	err     error
 }
 
 // cacheEntry is one memoized preview, keyed by the host and path it was
@@ -156,12 +197,20 @@ type cacheEntry struct {
 //
 // The zero value is not useful. Use New.
 type Model struct {
+	// theme styles pane focus, titles, controls and search matches.
+	theme ui.Theme
+
 	// host is the hostname every entry, preview request and cache entry in
 	// this Model belongs to.
 	host string
 
 	// preview fetches a preview's lines. See PreviewFunc.
 	preview PreviewFunc
+
+	// selectLog fetches the committed log to a local snapshot; search operates
+	// only on that snapshot.
+	selectLog SelectFunc
+	search    SearchFunc
 
 	// ctxFunc builds the context/CancelFunc pair for each preview request.
 	// See ContextFunc.
@@ -211,6 +260,31 @@ type Model struct {
 	// request whose Gen still matches gen at the time it was applied.
 	previewLines []string
 
+	// previewViewport owns independent scrolling for the fixed-size preview
+	// pane. previewFocused determines whether navigation keys move it or the
+	// file picker.
+	previewViewport viewport.Model
+	previewFocused  bool
+
+	selecting     bool
+	selectedPath  string
+	selectedLocal string
+	selectedLines []string
+	selectCancel  context.CancelFunc
+
+	pathSearching  bool
+	pathInput      textinput.Model
+	activeScanPath string
+
+	searching           bool
+	searchInput         textinput.Model
+	searchQuery         string
+	searchGen           uint64
+	searchCancel        context.CancelFunc
+	matches             []ui.SearchMatch
+	matchIdx            int
+	filteredLineNumbers []int
+
 	// requestCount is what PreviewRequestCount reports: how many times
 	// Update has issued a preview request (a cache miss on a settled,
 	// current-generation debounce tick).
@@ -226,9 +300,27 @@ type Model struct {
 // using preview to fetch previews and DefaultDebounce as the debounce
 // delay unless overridden by an Option.
 func New(host string, preview PreviewFunc, opts ...Option) Model {
+	previewViewport := viewport.New(60, 20)
+	previewViewport.SetContent("Select a log to load its preview.")
+	searchInput := textinput.New()
+	searchInput.Prompt = "/ "
+	pathInput := textinput.New()
+	pathInput.Prompt = "path › "
+	pathInput.Placeholder = "/opt/app/logs or /srv/*/logs"
 	m := Model{
+		theme:   ui.DefaultTheme(),
 		host:    host,
 		preview: preview,
+		selectLog: func(context.Context, string, ui.ScanEntry) (string, []string, error) {
+			return "", nil, errors.New("browser: no SelectFunc configured")
+		},
+		search: func(context.Context, string, string, bool) ([]ui.SearchMatch, error) {
+			return nil, errors.New("browser: no SearchFunc configured")
+		},
+		previewViewport: previewViewport,
+		searchInput:     searchInput,
+		pathInput:       pathInput,
+		matchIdx:        -1,
 		ctxFunc: func() (context.Context, context.CancelFunc) {
 			return context.WithCancel(context.Background())
 		},
@@ -294,6 +386,31 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		result, cmd := next.applyHighlightChange()
 		return result, cmd
 
+	case ui.PathScanStartedMsg:
+		if msg.Host != m.host {
+			return m, nil
+		}
+		next := m.withEntries(nil)
+		next.scanDone = false
+		next.activeScanPath = msg.Path
+		next.hasHighlight = false
+		next.highlightedPath = ""
+		next.selectedPath = ""
+		next.selectedLocal = ""
+		next.selectedLines = nil
+		next.matches = nil
+		next.matchIdx = -1
+		next.previewViewport.SetContent("Scanning remote path…")
+		return next, nil
+
+	case ui.ThemeChangedMsg:
+		next := m
+		next.theme = ui.DefaultTheme().WithColors(msg.Primary, msg.Secondary)
+		if next.selectedLocal != "" {
+			next.refreshSelectedContent()
+		}
+		return next, nil
+
 	case ui.ScanDoneMsg:
 		if msg.Host != m.host {
 			return m, nil
@@ -301,13 +418,63 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		next := m
 		next.scanDone = true
 		return next, nil
+	case logSelectedMsg:
+		if msg.host != m.host {
+			return m, nil
+		}
+		next := m
+		next.selecting = false
+		next.selectCancel = nil
+		if msg.err != nil {
+			next.previewViewport.SetContent("Selection failed. Press Space to retry.")
+			return next, func() tea.Msg {
+				return ui.ErrorMsg{Err: fmt.Errorf("selecting %s:%s: %w", msg.host, msg.remote, msg.err)}
+			}
+		}
+		next.selectedPath = msg.remote
+		next.selectedLocal = msg.local
+		next.selectedLines = append([]string(nil), msg.lines...)
+		next.previewLines = append([]string(nil), msg.lines...)
+		next.previewViewport.SetContent(strings.Join(msg.lines, "\n"))
+		next.previewViewport.GotoTop()
+		next.previewFocused = true
+		if next.searchCancel != nil {
+			next.searchCancel()
+		}
+		next.searchCancel = nil
+		next.searchGen++
+		next.searching = false
+		next.searchInput.Blur()
+		next.searchInput.SetValue("")
+		next.searchQuery = ""
+		next.matches = nil
+		next.matchIdx = -1
+		next.filteredLineNumbers = nil
+		return next, func() tea.Msg { return ui.ClearErrorMsg{} }
+
+	case browserSearchResultsMsg:
+		if msg.local != m.selectedLocal || msg.gen != m.searchGen {
+			return m, nil
+		}
+		next := m
+		next.searchCancel = nil
+		if msg.err != nil {
+			return next, func() tea.Msg {
+				return ui.ErrorMsg{Err: fmt.Errorf("searching %s: %w", msg.local, msg.err)}
+			}
+		}
+		next.searchQuery = msg.query
+		next.matches = append([]ui.SearchMatch(nil), msg.matches...)
+		next.matchIdx = -1
+		if len(next.matches) > 0 {
+			next.matchIdx = 0
+		}
+		next.refreshSelectedContent()
+		next.previewViewport.GotoTop()
+		return next, func() tea.Msg { return ui.ClearErrorMsg{} }
 
 	case tea.KeyMsg:
-		next := m
-		var listCmd tea.Cmd
-		next.list, listCmd = next.list.Update(msg)
-		result, hiCmd := next.applyHighlightChange()
-		return result, tea.Batch(listCmd, hiCmd)
+		return m.handleKey(msg)
 
 	case ui.PreviewDebounceMsg:
 		return m.handleDebounce(msg)
@@ -318,6 +485,220 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 	default:
 		return m, nil
 	}
+}
+
+func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
+	if m.pathSearching {
+		switch msg.Type {
+		case tea.KeyEsc:
+			next := m
+			next.pathSearching = false
+			next.pathInput.Blur()
+			return next, nil
+		case tea.KeyEnter:
+			path := strings.TrimSpace(m.pathInput.Value())
+			if path == "" {
+				return m, nil
+			}
+			next := m
+			next.pathSearching = false
+			next.pathInput.Blur()
+			return next, func() tea.Msg { return ui.PathScanRequestedMsg{Host: m.host, Path: path} }
+		default:
+			next := m
+			var cmd tea.Cmd
+			next.pathInput, cmd = next.pathInput.Update(msg)
+			return next, cmd
+		}
+	}
+	if m.searching {
+		switch msg.Type {
+		case tea.KeyEsc:
+			next := m
+			if next.searchCancel != nil {
+				next.searchCancel()
+			}
+			next.searchCancel = nil
+			next.searchGen++
+			next.searching = false
+			next.searchInput.Blur()
+			next.searchInput.SetValue("")
+			next.searchQuery = ""
+			next.matches = nil
+			next.matchIdx = -1
+			next.filteredLineNumbers = nil
+			next.previewViewport.SetContent(strings.Join(next.selectedLines, "\n"))
+			next.previewViewport.GotoTop()
+			return next, nil
+		case tea.KeyEnter:
+			next := m
+			next.searching = false
+			next.searchInput.Blur()
+			return next, nil
+		default:
+			next := m
+			oldQuery := next.searchInput.Value()
+			var inputCmd tea.Cmd
+			next.searchInput, inputCmd = next.searchInput.Update(msg)
+			if next.searchInput.Value() == oldQuery {
+				return next, inputCmd
+			}
+			filtered, searchCmd := next.startLiveSearch()
+			return filtered, searchCmd
+		}
+	}
+
+	if msg.Type == tea.KeyEsc {
+		return m, func() tea.Msg { return ui.BackMsg{} }
+	}
+	if msg.Type == tea.KeyCtrlS {
+		next := m
+		next.pathSearching = true
+		next.pathInput.SetValue(m.activeScanPath)
+		next.pathInput.CursorEnd()
+		return next, next.pathInput.Focus()
+	}
+	if msg.Type == tea.KeyTab || msg.Type == tea.KeyShiftTab {
+		next := m
+		next.previewFocused = !m.previewFocused
+		return next, nil
+	}
+	if !m.previewFocused && msg.String() == " " {
+		return m.startSelection()
+	}
+	if m.previewFocused {
+		switch msg.String() {
+		case "/":
+			if m.selectedLocal == "" {
+				return m, nil
+			}
+			next := m
+			next.searching = true
+			return next, next.searchInput.Focus()
+		case "n":
+			return m.stepSearch(1), nil
+		case "N":
+			return m.stepSearch(-1), nil
+		}
+		next := m
+		var cmd tea.Cmd
+		next.previewViewport, cmd = next.previewViewport.Update(msg)
+		return next, cmd
+	}
+
+	next := m
+	var listCmd tea.Cmd
+	next.list, listCmd = next.list.Update(msg)
+	result, hiCmd := next.applyHighlightChange()
+	return result, tea.Batch(listCmd, hiCmd)
+}
+
+func (m Model) startSelection() (ui.ScreenModel, tea.Cmd) {
+	entry, ok := m.Highlighted()
+	if !ok || m.selecting {
+		return m, nil
+	}
+	if m.selectedPath == entry.Path && m.selectedLocal != "" {
+		next := m
+		next.previewFocused = true
+		return next, nil
+	}
+
+	ctx, cancel := m.ctxFunc()
+	next := m
+	if next.selectCancel != nil {
+		next.selectCancel()
+	}
+	next.selectCancel = cancel
+	next.selecting = true
+	next.previewViewport.SetContent("Fetching local snapshot for search…")
+	selector := m.selectLog
+	host := m.host
+	cmd := func() tea.Msg {
+		defer cancel()
+		localPath, lines, err := selector(ctx, host, entry)
+		return logSelectedMsg{host: host, remote: entry.Path, local: localPath, lines: lines, err: err}
+	}
+	return next, cmd
+}
+
+func (m Model) startLiveSearch() (Model, tea.Cmd) {
+	if m.searchCancel != nil {
+		m.searchCancel()
+	}
+	m.searchCancel = nil
+	m.searchGen++
+	query := m.searchInput.Value()
+	if query == "" || m.selectedLocal == "" {
+		m.searchQuery = ""
+		m.matches = nil
+		m.matchIdx = -1
+		m.filteredLineNumbers = nil
+		m.previewViewport.SetContent(strings.Join(m.selectedLines, "\n"))
+		m.previewViewport.GotoTop()
+		return m, nil
+	}
+
+	search := m.search
+	ctx, cancel := m.ctxFunc()
+	m.searchCancel = cancel
+	localPath := m.selectedLocal
+	gen := m.searchGen
+	cmd := func() tea.Msg {
+		defer cancel()
+		matches, err := search(ctx, localPath, query, false)
+		return browserSearchResultsMsg{local: localPath, query: query, gen: gen, matches: matches, err: err}
+	}
+	return m, cmd
+}
+
+func (m Model) stepSearch(delta int) Model {
+	if len(m.matches) == 0 {
+		return m
+	}
+	m.matchIdx = (m.matchIdx + delta + len(m.matches)) % len(m.matches)
+	m.refreshSelectedContent()
+	line := m.matches[m.matchIdx].Line
+	for index, sourceLine := range m.filteredLineNumbers {
+		if sourceLine == line {
+			m.previewViewport.SetYOffset(index)
+			break
+		}
+	}
+	return m
+}
+
+func (m *Model) refreshSelectedContent() {
+	if m.searchQuery == "" {
+		m.filteredLineNumbers = nil
+		m.previewViewport.SetContent(strings.Join(m.selectedLines, "\n"))
+		return
+	}
+
+	currentLine := -1
+	if m.matchIdx >= 0 && m.matchIdx < len(m.matches) {
+		currentLine = m.matches[m.matchIdx].Line
+	}
+	seen := make(map[int]bool, len(m.matches))
+	filtered := make([]string, 0, len(m.matches))
+	m.filteredLineNumbers = m.filteredLineNumbers[:0]
+	for _, match := range m.matches {
+		if seen[match.Line] || match.Line <= 0 || match.Line > len(m.selectedLines) {
+			continue
+		}
+		seen[match.Line] = true
+		line := fmt.Sprintf("%6d │ %s", match.Line, m.selectedLines[match.Line-1])
+		if match.Line == currentLine {
+			line = m.theme.LineMatch.Reverse(true).Render(line)
+		}
+		filtered = append(filtered, line)
+		m.filteredLineNumbers = append(m.filteredLineNumbers, match.Line)
+	}
+	if len(filtered) == 0 {
+		m.previewViewport.SetContent("No matching lines.")
+		return
+	}
+	m.previewViewport.SetContent(strings.Join(filtered, "\n"))
 }
 
 // withEntries returns a copy of m with entries replaced by newEntries and
@@ -334,7 +715,10 @@ func (m Model) withEntries(newEntries []ui.ScanEntry) Model {
 	for i, e := range newEntries {
 		items[i] = entryItem{Entry: e}
 	}
-	newList := picker.New(items)
+	layout := calculateLayout(m.width, m.height)
+	newList := picker.New(items).
+		SetHeight(max(1, layout.leftContentHeight-5)).
+		SetWidth(max(1, layout.leftContentWidth-2))
 
 	if m.hasHighlight {
 		if idx := indexOfPath(newEntries, m.highlightedPath); idx >= 0 {
@@ -393,6 +777,21 @@ func (m Model) applyHighlightChange() (Model, tea.Cmd) {
 		next.highlightedHost = ""
 	}
 
+	// Space commits a local snapshot. Once committed, moving around the left
+	// list must not replace the searchable right-pane content with hover
+	// previews; another Space explicitly replaces the selection.
+	if next.selectedLocal != "" {
+		return next, nil
+	}
+
+	next.previewLines = nil
+	next.previewViewport.GotoTop()
+	if ok {
+		next.previewViewport.SetContent("Loading preview…")
+	} else {
+		next.previewViewport.SetContent("Select a log to load its preview.")
+	}
+
 	if !ok {
 		return next, nil
 	}
@@ -418,6 +817,8 @@ func (m Model) handleDebounce(msg ui.PreviewDebounceMsg) (ui.ScreenModel, tea.Cm
 		next := m
 		next.cache = reordered
 		next.previewLines = entry.lines
+		next.previewViewport.SetContent(strings.Join(entry.lines, "\n"))
+		next.previewViewport.GotoTop()
 		return next, nil
 	}
 
@@ -458,6 +859,8 @@ func (m Model) handlePreviewMsg(msg ui.PreviewMsg) (ui.ScreenModel, tea.Cmd) {
 
 	if msg.Gen == m.gen {
 		next.previewLines = lines
+		next.previewViewport.SetContent(strings.Join(lines, "\n"))
+		next.previewViewport.GotoTop()
 		next.cancel = nil
 	}
 
@@ -499,41 +902,138 @@ func cacheStore(cache []cacheEntry, entry cacheEntry) []cacheEntry {
 	return updated
 }
 
-// View renders the split pane: the file list on the left, the preview pane
-// on the right, sized to the area Resize was last called with.
-func (m Model) View() string {
-	var b strings.Builder
-
-	b.WriteString(m.host)
-	if m.scanDone {
-		b.WriteString(" (scan done)")
-	}
-	b.WriteByte('\n')
-
-	b.WriteString(m.list.View())
-	b.WriteString("---\n")
-
-	for _, line := range m.previewLines {
-		b.WriteString(line)
-		b.WriteByte('\n')
-	}
-
-	return b.String()
+type browserLayout struct {
+	stacked                 bool
+	leftWidth, rightWidth   int
+	leftHeight, rightHeight int
+	leftContentWidth        int
+	rightContentWidth       int
+	leftContentHeight       int
+	rightContentHeight      int
 }
 
-// Resize records the area the screen has to render into and returns the
-// updated Model.
+func calculateLayout(width, height int) browserLayout {
+	if width <= 0 {
+		width = 100
+	}
+	if height <= 0 {
+		height = 30
+	}
+	layout := browserLayout{}
+	if width < 72 {
+		layout.stacked = true
+		layout.leftWidth, layout.rightWidth = width, width
+		layout.leftHeight = height / 2
+		layout.rightHeight = height - layout.leftHeight
+	} else {
+		layout.leftWidth = width * 2 / 5
+		layout.rightWidth = width - layout.leftWidth - 1
+		layout.leftHeight, layout.rightHeight = height, height
+	}
+	layout.leftContentWidth = max(20, layout.leftWidth-4)
+	layout.rightContentWidth = max(20, layout.rightWidth-4)
+	layout.leftContentHeight = max(4, layout.leftHeight-2)
+	layout.rightContentHeight = max(4, layout.rightHeight-2)
+	return layout
+}
+
+// View renders a fixed-size split pane. Preview content is supplied by the
+// viewport, so long lines and large files cannot grow either pane.
+func (m Model) View() string {
+	layout := calculateLayout(m.width, m.height)
+
+	var left strings.Builder
+	leftTextWidth := max(1, layout.leftContentWidth-2)
+	rightTextWidth := max(1, layout.rightContentWidth-2)
+
+	left.WriteString(m.theme.Title.Render(fitLine("Logs — "+m.host, leftTextWidth)))
+	left.WriteByte('\n')
+	if m.scanDone {
+		fmt.Fprintf(&left, "%d files\n\n", len(m.entries))
+	} else if m.activeScanPath != "" {
+		left.WriteString(fitLine("Scanning "+m.activeScanPath+"…", leftTextWidth))
+		left.WriteString("\n\n")
+	} else {
+		left.WriteString("Scanning…\n\n")
+	}
+	left.WriteString(m.list.View())
+	leftControl := "space select • ctrl+s scan path • tab preview • esc hosts"
+	if m.pathSearching {
+		leftControl = m.pathInput.View()
+	}
+	left.WriteString(m.theme.Dim.Render(fitLine(leftControl, leftTextWidth)))
+
+	var right strings.Builder
+	title := "Preview"
+	if m.selectedPath != "" {
+		title = "Selected — " + m.selectedPath
+	} else if m.hasHighlight {
+		title += " — " + m.highlightedPath
+	}
+	titleStyle := m.theme.Title
+	if m.selectedPath != "" {
+		titleStyle = m.theme.Match
+	}
+	right.WriteString(titleStyle.Render(fitLine(title, rightTextWidth)))
+	right.WriteString("\n\n")
+	right.WriteString(m.previewViewport.View())
+	right.WriteByte('\n')
+	control := "tab files • ↑/↓/pgup/pgdn scroll • esc hosts"
+	if m.selectedLocal != "" {
+		control = fmt.Sprintf("/ search • n/N match • %d/%d • tab files", m.matchIdx+1, len(m.matches))
+	}
+	if m.searching {
+		control = fmt.Sprintf("%s • %d matching lines", m.searchInput.View(), len(m.filteredLineNumbers))
+	}
+	right.WriteString(m.theme.Dim.Render(fitLine(control, rightTextWidth)))
+
+	pane := func(contentWidth, contentHeight int, active bool) lipgloss.Style {
+		style := m.theme.PaneInactive
+		if active {
+			style = m.theme.PaneActive
+		}
+		return style.
+			Width(contentWidth).
+			Height(contentHeight).
+			Padding(0, 1).
+			Border(lipgloss.RoundedBorder())
+	}
+	leftPane := pane(layout.leftContentWidth, layout.leftContentHeight, !m.previewFocused).Render(left.String())
+	rightPane := pane(layout.rightContentWidth, layout.rightContentHeight, m.previewFocused).Render(right.String())
+	if layout.stacked {
+		return lipgloss.JoinVertical(lipgloss.Left, leftPane, rightPane)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, leftPane, " ", rightPane)
+}
+
+func fitLine(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width == 1 {
+		return "…"
+	}
+	return string(runes[:width-1]) + "…"
+}
+
+// Resize records the fixed pane dimensions and sizes both independently
+// scrollable components to their content boxes.
 func (m Model) Resize(width, height int) ui.ScreenModel {
 	next := m
 	next.width = width
 	next.height = height
+	layout := calculateLayout(width, height)
 
-	listHeight := height - 4
-	if listHeight < 0 {
-		listHeight = 0
-	}
-	next.list = next.list.SetHeight(listHeight)
-
+	listHeight := max(1, layout.leftContentHeight-5)
+	next.list = next.list.SetHeight(listHeight).SetWidth(max(1, layout.leftContentWidth-2))
+	next.previewViewport.Width = max(1, layout.rightContentWidth-2)
+	next.previewViewport.Height = max(1, layout.rightContentHeight-3)
+	next.searchInput.Width = max(1, layout.rightContentWidth-4)
+	next.pathInput.Width = max(1, layout.leftContentWidth-4)
 	return next
 }
 
@@ -585,4 +1085,50 @@ func (m Model) PreviewRequestCount() int {
 // be current rather than stale (mechanic 3).
 func (m Model) Gen() uint64 {
 	return m.gen
+}
+
+// PreviewOffset returns the first preview row currently visible.
+func (m Model) PreviewOffset() int {
+	return m.previewViewport.YOffset
+}
+
+// PreviewFocused reports whether navigation keys scroll the preview pane.
+func (m Model) PreviewFocused() bool {
+	return m.previewFocused
+}
+
+// SelectedPath returns the remote path committed with Space.
+func (m Model) SelectedPath() string {
+	return m.selectedPath
+}
+
+// SelectedLocal returns the fetched snapshot searched by the right pane.
+func (m Model) SelectedLocal() string {
+	return m.selectedLocal
+}
+
+// Searching reports whether the right-pane search input is focused.
+func (m Model) Searching() bool {
+	return m.searching
+}
+
+// SearchMatchCount returns the number of matches from the latest search.
+func (m Model) SearchMatchCount() int {
+	return len(m.matches)
+}
+
+// CurrentSearchMatchIndex returns the active search result index, or -1.
+func (m Model) CurrentSearchMatchIndex() int {
+	return m.matchIdx
+}
+
+// FilteredLineCount returns how many source lines remain visible for the live
+// query. Multiple hits on one source line count as one visible line.
+func (m Model) FilteredLineCount() int {
+	return len(m.filteredLineNumbers)
+}
+
+// ActiveScanPath returns the one-off path currently being discovered.
+func (m Model) ActiveScanPath() string {
+	return m.activeScanPath
 }

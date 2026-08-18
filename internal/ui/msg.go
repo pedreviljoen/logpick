@@ -121,6 +121,12 @@ type StatusMsg struct {
 	Text string
 }
 
+// ThemeChangedMsg applies a live palette preview to the root and every screen.
+type ThemeChangedMsg struct {
+	Primary   string
+	Secondary string
+}
+
 // --- Hosts and connection ---------------------------------------------------
 
 // HostsLoadedMsg carries the host history read from the state file.
@@ -238,6 +244,19 @@ type ScanDoneMsg struct {
 	Skipped int
 	// Truncated reports whether the entry cap was hit.
 	Truncated bool
+}
+
+// PathScanRequestedMsg asks the composition layer to run discovery against a
+// one-off remote path while retaining the active profile's other scan rules.
+type PathScanRequestedMsg struct {
+	Host string
+	Path string
+}
+
+// PathScanStartedMsg clears the browser list for a one-off path scan.
+type PathScanStartedMsg struct {
+	Host string
+	Path string
 }
 
 // --- Preview ----------------------------------------------------------------

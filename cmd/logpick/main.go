@@ -2,6 +2,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"runtime/debug"
 
@@ -14,7 +15,9 @@ var version string
 
 func main() {
 	if err := newRootCmd().Execute(); err != nil {
-		// cobra has already printed the error.
+		// SilenceErrors keeps Cobra from printing the same failure with usage;
+		// the entry point still needs to surface the actionable error.
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }

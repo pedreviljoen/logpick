@@ -23,10 +23,13 @@ package browser_test
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/pedreviljoen/logpick/internal/ui"
@@ -81,6 +84,160 @@ func pressKeys(t *testing.T, m browser.Model, keys ...tea.KeyType) browser.Model
 		m, _ = update(t, m, tea.KeyMsg{Type: k})
 	}
 	return m
+}
+
+func TestModel_CtrlSRequestsOneOffPathScan(t *testing.T) {
+	m := browser.New(testHost, noopPreview)
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyCtrlS})
+	for _, r := range "/opt/app/logs" {
+		m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	m, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("path scan Enter returned nil Cmd")
+	}
+	raw := cmd()
+	msg, ok := raw.(ui.PathScanRequestedMsg)
+	if !ok {
+		t.Fatalf("path scan command returned %T, want ui.PathScanRequestedMsg", raw)
+	}
+	want := ui.PathScanRequestedMsg{Host: testHost, Path: "/opt/app/logs"}
+	if diff := cmp.Diff(want, msg); diff != "" {
+		t.Fatalf("path scan request mismatch (-want +got):\n%s", diff)
+	}
+
+	m, _ = update(t, m, ui.PathScanStartedMsg{Host: testHost, Path: msg.Path})
+	if m.ActiveScanPath() != msg.Path || len(m.Entries()) != 0 {
+		t.Fatalf("path scan start kept path=%q entries=%d", m.ActiveScanPath(), len(m.Entries()))
+	}
+}
+
+func TestModel_SpaceFetchesLocalSnapshotAndSearchesIt(t *testing.T) {
+	const remotePath = "/var/log/app.log"
+	const localPath = "/tmp/logpick/app.log"
+	selectedLines := make([]string, 20)
+	for i := range selectedLines {
+		selectedLines[i] = fmt.Sprintf("line %02d", i+1)
+	}
+	selectedLines[9] = "error happened"
+	selector := func(_ context.Context, host string, entry ui.ScanEntry) (string, []string, error) {
+		if host != testHost || entry.Path != remotePath {
+			t.Fatalf("selector got %s:%s, want %s:%s", host, entry.Path, testHost, remotePath)
+		}
+		return localPath, selectedLines, nil
+	}
+	var searched []string
+	searcher := func(_ context.Context, path, query string, regex bool) ([]ui.SearchMatch, error) {
+		if path != localPath || regex {
+			t.Fatalf("search got path=%q query=%q regex=%v", path, query, regex)
+		}
+		searched = append(searched, query)
+		var matches []ui.SearchMatch
+		for i, line := range selectedLines {
+			if start := strings.Index(line, query); start >= 0 {
+				matches = append(matches, ui.SearchMatch{Line: i + 1, Start: start, End: start + len(query), Text: line})
+			}
+		}
+		return matches, nil
+	}
+
+	m := browser.New(testHost, noopPreview, browser.WithSelector(selector), browser.WithSearch(searcher))
+	m = m.Resize(100, 12).(browser.Model)
+	m, _ = update(t, m, ui.ScanEntriesMsg{Host: testHost, Entries: entriesFor(remotePath, "/var/log/other.log")})
+	m, selectCmd := update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	if selectCmd == nil {
+		t.Fatal("space returned nil Cmd, want local snapshot fetch")
+	}
+	m, _ = update(t, m, selectCmd())
+	if m.SelectedPath() != remotePath || m.SelectedLocal() != localPath {
+		t.Fatalf("selected = %q -> %q, want %q -> %q", m.SelectedPath(), m.SelectedLocal(), remotePath, localPath)
+	}
+	if !m.PreviewFocused() {
+		t.Fatal("successful selection did not focus the right pane")
+	}
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if m.SelectedPath() != remotePath {
+		t.Fatalf("moving the left cursor replaced selected path with %q", m.SelectedPath())
+	}
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	if !m.Searching() {
+		t.Fatal("/ did not focus search for the selected local snapshot")
+	}
+	for _, r := range "error" {
+		var liveCmd tea.Cmd
+		m, liveCmd = update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		if liveCmd == nil {
+			t.Fatalf("typing %q returned nil live-search Cmd", r)
+		}
+		m, _ = update(t, m, liveCmd())
+	}
+	if diff := cmp.Diff([]string{"e", "er", "err", "erro", "error"}, searched); diff != "" {
+		t.Fatalf("live queries mismatch (-want +got):\n%s", diff)
+	}
+	if m.SearchMatchCount() != 1 || m.CurrentSearchMatchIndex() != 0 {
+		t.Fatalf("search state = match %d of %d, want 0 of 1", m.CurrentSearchMatchIndex(), m.SearchMatchCount())
+	}
+	if got := m.FilteredLineCount(); got != 1 {
+		t.Fatalf("filtered line count = %d, want only the matching line", got)
+	}
+	if got := m.PreviewOffset(); got != 0 {
+		t.Fatalf("preview offset = %d, want filtered result at offset 0", got)
+	}
+	m, enterCmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if enterCmd != nil || m.Searching() {
+		t.Fatal("enter should close live search without issuing another search")
+	}
+}
+
+func TestModel_PreviewScrollsIndependently(t *testing.T) {
+	m := browser.New(testHost, noopPreview)
+	resized := m.Resize(100, 12)
+	m = resized.(browser.Model)
+	paths := make([]string, 80)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("/var/log/application/very-long-service-name-%02d.log", i)
+	}
+	entries := entriesFor(paths...)
+	m, _ = update(t, m, ui.ScanEntriesMsg{Host: testHost, Entries: entries})
+
+	lines := make([]string, 40)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line %02d", i)
+	}
+	lines[0] = strings.Repeat("long-log-line ", 50)
+	m, _ = update(t, m, ui.PreviewMsg{Gen: m.Gen(), Host: testHost, Path: entries[0].Path, Lines: lines})
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if !m.PreviewFocused() {
+		t.Fatal("tab did not focus the preview pane")
+	}
+	for range 8 {
+		m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	if got := m.PreviewOffset(); got == 0 {
+		t.Fatal("down keys did not scroll the focused preview viewport")
+	}
+	view := m.View()
+	if got := lipgloss.Height(view); got > 12 {
+		t.Fatalf("browser height = %d, want at most 12:\n%s", got, view)
+	}
+	if got := lipgloss.Width(view); got > 100 {
+		t.Fatalf("browser width = %d, want at most 100", got)
+	}
+}
+
+func TestModel_EscapeReturnsToHosts(t *testing.T) {
+	m := browser.New(testHost, noopPreview)
+	_, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("escape returned nil Cmd, want ui.BackMsg")
+	}
+	msg := cmd()
+	if _, ok := msg.(ui.BackMsg); !ok {
+		t.Fatalf("escape command returned %T, want ui.BackMsg", msg)
+	}
 }
 
 func TestModel_EntriesPopulateProgressively(t *testing.T) {

@@ -31,10 +31,12 @@ type KeyMap struct {
 	Delete  key.Binding
 	Pin     key.Binding
 	NewHost key.Binding
+	Theme   key.Binding
 
 	// Browser screen.
-	Fetch  key.Binding
-	Follow key.Binding
+	Fetch    key.Binding
+	Follow   key.Binding
+	ScanPath key.Binding
 
 	// Viewer screen.
 	Search    key.Binding
@@ -81,12 +83,15 @@ func DefaultKeyMap() KeyMap {
 			key.WithHelp("esc", "back"),
 		),
 		Quit: key.NewBinding(
-			key.WithKeys("q", "ctrl+c"),
-			key.WithHelp("q", "quit"),
+			// Printable keys must reach focused form and filter inputs. A global
+			// plain "q" binding made hostnames, paths and commands containing q
+			// impossible to type.
+			key.WithKeys("ctrl+c"),
+			key.WithHelp("ctrl+c", "quit"),
 		),
 		Help: key.NewBinding(
-			key.WithKeys("?"),
-			key.WithHelp("?", "help"),
+			key.WithKeys("f1"),
+			key.WithHelp("f1", "help"),
 		),
 
 		Filter: key.NewBinding(
@@ -114,6 +119,10 @@ func DefaultKeyMap() KeyMap {
 			key.WithKeys("ctrl+n"),
 			key.WithHelp("ctrl+n", "new host"),
 		),
+		Theme: key.NewBinding(
+			key.WithKeys("ctrl+t"),
+			key.WithHelp("ctrl+t", "theme"),
+		),
 
 		Fetch: key.NewBinding(
 			key.WithKeys("f"),
@@ -122,6 +131,10 @@ func DefaultKeyMap() KeyMap {
 		Follow: key.NewBinding(
 			key.WithKeys("F"),
 			key.WithHelp("F", "follow"),
+		),
+		ScanPath: key.NewBinding(
+			key.WithKeys("ctrl+s"),
+			key.WithHelp("ctrl+s", "scan path"),
 		),
 
 		Search: key.NewBinding(
@@ -155,8 +168,8 @@ func (k KeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.PageUp, k.PageDown, k.Top, k.Bottom},
 		{k.Enter, k.Back, k.Filter, k.Next, k.Prev},
-		{k.Delete, k.Pin, k.NewHost},
-		{k.Fetch, k.Follow},
+		{k.Delete, k.Pin, k.NewHost, k.Theme},
+		{k.Fetch, k.Follow, k.ScanPath},
 		{k.Search, k.NextMatch, k.PrevMatch, k.ToggleRe},
 		{k.Help, k.Quit},
 	}

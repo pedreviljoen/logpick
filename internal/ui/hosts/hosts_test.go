@@ -164,7 +164,201 @@ func (r *recordingRemover) remove(host string) error {
 
 // --- Mechanic 1: a host matching an existing rule connects without prompting
 
+func TestModel_FirstRunGuidance(t *testing.T) {
+	m := hosts.New(nil, failIfCalledList(t))
+	m, _ = update(t, m, ui.HostsLoadedMsg{})
+	if got := m.View(); !strings.Contains(got, "New connection") || !strings.Contains(got, "Host (user@hostname)") || !strings.Contains(got, "Identity file") {
+		t.Fatalf("first-run form is missing connection guidance:\n%s", got)
+	}
+
+	const host = "example-host"
+	m = typeString(t, m, host)
+	if got := m.View(); !strings.Contains(got, host) || !strings.Contains(got, "Enter connect") {
+		t.Fatalf("first-run form does not show the entered host and next action:\n%s", got)
+	}
+}
+
+func TestModel_FirstRunIdentityIsOptional(t *testing.T) {
+	const host = "agent-backed.example.com"
+	var gotExec []string
+	prober := func(_ context.Context, _ string, exec []string) error {
+		gotExec = append([]string(nil), exec...)
+		return nil
+	}
+	m := hosts.New(nil, failIfCalledList(t), hosts.WithProber(prober))
+	m, _ = update(t, m, ui.HostsLoadedMsg{})
+	m = typeString(t, m, host)
+	_, probeCmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if probeCmd == nil {
+		t.Fatal("blank identity returned nil probe command")
+	}
+	_ = probeCmd()
+	if diff := cmp.Diff(config.DefaultProfile.Exec, gotExec); diff != "" {
+		t.Fatalf("blank identity changed the default SSH template (-want +got):\n%s", diff)
+	}
+}
+
+func TestModel_ThemeEditorPreviewsAndSavesHexPalette(t *testing.T) {
+	var savedPrimary, savedSecondary string
+	saver := func(primary, secondary string) error {
+		savedPrimary, savedSecondary = primary, secondary
+		return nil
+	}
+	m := hosts.New(nil, failIfCalledList(t), hosts.WithThemeSaver(saver))
+	m, _ = update(t, m, ui.HostsLoadedMsg{Hosts: []ui.HostSummary{{Name: "example.com", Profile: "default"}}})
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyCtrlT})
+	if !m.Theming() {
+		t.Fatal("ctrl+t did not open the theme editor")
+	}
+
+	var previewCmd tea.Cmd
+	for _, r := range "#112233" {
+		m, previewCmd = update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	if previewCmd == nil {
+		t.Fatal("completing the primary hex color returned no live-preview command")
+	}
+	preview, ok := previewCmd().(ui.ThemeChangedMsg)
+	if !ok || preview.Primary != "#112233" {
+		t.Fatalf("primary preview = %#v, want #112233", preview)
+	}
+	m, _ = update(t, m, preview)
+
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	for _, r := range "#ffaa00" {
+		m, previewCmd = update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	preview, ok = previewCmd().(ui.ThemeChangedMsg)
+	if !ok || preview.Secondary != "#ffaa00" {
+		t.Fatalf("secondary preview = %#v, want #ffaa00", preview)
+	}
+	m, _ = update(t, m, preview)
+
+	m, saveCmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if saveCmd == nil {
+		t.Fatal("theme Enter returned nil save command")
+	}
+	m, _ = update(t, m, saveCmd())
+	if m.Theming() {
+		t.Fatal("successful theme save left the editor open")
+	}
+	if savedPrimary != "#112233" || savedSecondary != "#ffaa00" {
+		t.Fatalf("saved palette = %q/%q", savedPrimary, savedSecondary)
+	}
+}
+
+func TestModel_FirstRunFormBuildsAuthenticatedExecTemplate(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "id_ed25519")
+	if err := os.WriteFile(keyPath, []byte("test-key"), 0o600); err != nil {
+		t.Fatalf("writing identity fixture: %v", err)
+	}
+	const host = "ec2-user@example.com"
+	var gotExec []string
+	prober := func(_ context.Context, gotHost string, exec []string) error {
+		if gotHost != host {
+			t.Fatalf("probe host = %q, want %q", gotHost, host)
+		}
+		gotExec = append([]string(nil), exec...)
+		return nil
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	m := hosts.New(nil, failIfCalledList(t),
+		hosts.WithProber(prober),
+		hosts.WithWriter(hosts.WriteConfigFile(configPath)),
+	)
+	m, _ = update(t, m, ui.HostsLoadedMsg{})
+	m = typeString(t, m, host)
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	m = typeString(t, m, keyPath)
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	m = typeString(t, m, "ssh -o BatchMode=yes")
+	m, probeCmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if probeCmd == nil {
+		t.Fatal("connection form returned nil probe command")
+	}
+	probeResult := probeCmd()
+
+	want := []string{"ssh", "-o", "BatchMode=yes", "-i", keyPath, "{host}", "--", "{cmd}"}
+	if diff := cmp.Diff(want, gotExec); diff != "" {
+		t.Fatalf("probe exec template mismatch (-want +got):\n%s", diff)
+	}
+
+	_, writeCmd := update(t, m, probeResult)
+	if writeCmd == nil {
+		t.Fatal("successful probe returned nil config write command")
+	}
+	if _, ok := writeCmd().(ui.HostSelectedMsg); !ok {
+		t.Fatal("config write did not continue to host selection")
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("loading generated config: %v", err)
+	}
+	if diff := cmp.Diff(want, cfg.Profiles[host].Exec); diff != "" {
+		t.Fatalf("persisted exec template mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestModel_FirstRunRejectsOpenIdentityPermissionsBeforeProbe(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "open.pem")
+	if err := os.WriteFile(keyPath, []byte("test-key"), 0o600); err != nil {
+		t.Fatalf("writing identity fixture: %v", err)
+	}
+	if err := os.Chmod(keyPath, 0o644); err != nil {
+		t.Fatalf("opening identity permissions: %v", err)
+	}
+
+	m := hosts.New(nil, failIfCalledList(t), hosts.WithProber(failIfCalledProber(t)))
+	m, _ = update(t, m, ui.HostsLoadedMsg{})
+	m = typeString(t, m, "ec2-user@example.com")
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	m = typeString(t, m, keyPath)
+	_, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("open identity permissions returned nil error command")
+	}
+	msg := cmd()
+	errMsg, ok := msg.(ui.ErrorMsg)
+	if !ok {
+		t.Fatalf("open identity permissions returned %T, want ui.ErrorMsg", msg)
+	}
+	if got := errMsg.Err.Error(); !strings.Contains(got, "0644") || !strings.Contains(got, "chmod 600") {
+		t.Fatalf("identity permission error is not actionable: %s", got)
+	}
+}
+
 func TestModel_HostMatchingExistingRuleConnectsWithoutPrompting(t *testing.T) {
+	t.Run("typing into an empty picker and pressing enter commits the hostname", func(t *testing.T) {
+		cfg := &config.Config{
+			Profiles: map[string]config.Profile{
+				"corp": {Exec: []string{"ssh", "{host}", "--", "{cmd}"}},
+			},
+			Matches: []config.MatchRule{{Host: "*.compute.amazonaws.com", Profile: "corp"}},
+		}
+		const host = "ec2-13-244-248-216.af-south-1.compute.amazonaws.com"
+
+		m := hosts.New(cfg, failIfCalledList(t),
+			hosts.WithProber(failIfCalledProber(t)),
+			hosts.WithWriter(failIfCalledWriter(t)),
+		)
+		m = typeString(t, m, host)
+
+		_, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		if cmd == nil {
+			t.Fatal("Enter on a hostname typed into an empty picker returned nil Cmd")
+		}
+		msg := cmd()
+		got, ok := msg.(ui.HostSelectedMsg)
+		if !ok {
+			t.Fatalf("Enter reported %T, want ui.HostSelectedMsg", msg)
+		}
+		want := ui.HostSelectedMsg{Host: host, Profile: "corp"}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Fatalf("HostSelectedMsg mismatch (-want +got):\n%s", diff)
+		}
+	})
+
 	t.Run("an existing history row commits without probing or writing", func(t *testing.T) {
 		summary := ui.HostSummary{
 			Name:     "jenkins-01.prod.internal",
@@ -254,15 +448,19 @@ func TestModel_FailedProbeWritesNothingAndSurfacesError(t *testing.T) {
 
 		m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyCtrlN})
 		m = typeString(t, m, host)
-		_, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+		m, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 		if cmd == nil {
 			t.Fatalf("Update(enter on a genuinely new host) returned a nil Cmd, want the probe command")
 		}
 
-		msg := cmd()
-		errMsg, ok := msg.(ui.ErrorMsg)
+		m, errCmd := update(t, m, cmd())
+		if errCmd == nil {
+			t.Fatal("failed probe result returned nil Cmd, want ui.ErrorMsg command")
+		}
+		errResult := errCmd()
+		errMsg, ok := errResult.(ui.ErrorMsg)
 		if !ok {
-			t.Fatalf("probe command reported %T, want ui.ErrorMsg", msg)
+			t.Fatalf("probe command reported %T, want ui.ErrorMsg", errResult)
 		}
 		if !errors.Is(errMsg.Err, probeErr) {
 			t.Fatalf("ErrorMsg.Err = %v, want it to wrap %v", errMsg.Err, probeErr)
@@ -282,6 +480,25 @@ func TestModel_FailedProbeWritesNothingAndSurfacesError(t *testing.T) {
 }
 
 // --- Mechanic 3: a successful probe writes the new profile
+
+func TestWriteConfigFileCreatesMissingParentDirectories(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "logpick", "config.toml")
+	const host = "example-host"
+
+	if err := hosts.WriteConfigFile(path)(host, host, config.DefaultProfile); err != nil {
+		t.Fatalf("WriteConfigFile(%s): %v", path, err)
+	}
+	if _, err := config.Load(path); err != nil {
+		t.Fatalf("loading newly created config: %v", err)
+	}
+	info, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("stat config directory: %v", err)
+	}
+	if got := info.Mode().Perm(); got&0o077 != 0 {
+		t.Fatalf("config directory permissions = %#o, want no group/world access", got)
+	}
+}
 
 func TestModel_SuccessfulProbeWritesNewProfile(t *testing.T) {
 	t.Run("a successful probe writes the new profile and match rule", func(t *testing.T) {
@@ -310,18 +527,9 @@ func TestModel_SuccessfulProbeWritesNewProfile(t *testing.T) {
 			t.Fatalf("Update(enter on a genuinely new host) returned a nil Cmd, want the probe command")
 		}
 
-		connectedMsg := probeCmd()
-		connected, ok := connectedMsg.(ui.ConnectedMsg)
-		if !ok {
-			t.Fatalf("probe command reported %T, want ui.ConnectedMsg", connectedMsg)
-		}
-		if diff := cmp.Diff(ui.ConnectedMsg{Host: host, Profile: host}, connected); diff != "" {
-			t.Fatalf("ConnectedMsg (-want +got):\n%s", diff)
-		}
-
-		_, writeCmd := update(t, m, connected)
+		_, writeCmd := update(t, m, probeCmd())
 		if writeCmd == nil {
-			t.Fatalf("Update(ConnectedMsg) returned a nil Cmd, want the write command")
+			t.Fatalf("successful probe result returned nil Cmd, want the write command")
 		}
 
 		selectedMsg := writeCmd()
@@ -409,15 +617,9 @@ func TestModel_PromotingMatchRulePreservesHandWrittenComment(t *testing.T) {
 			t.Fatalf("Update(enter on a genuinely new host) returned a nil Cmd, want the probe command")
 		}
 
-		connectedMsg := probeCmd()
-		connected, ok := connectedMsg.(ui.ConnectedMsg)
-		if !ok {
-			t.Fatalf("probe command reported %T, want ui.ConnectedMsg", connectedMsg)
-		}
-
-		_, writeCmd := update(t, m, connected)
+		_, writeCmd := update(t, m, probeCmd())
 		if writeCmd == nil {
-			t.Fatalf("Update(ConnectedMsg) returned a nil Cmd, want the write command")
+			t.Fatalf("successful probe result returned nil Cmd, want the write command")
 		}
 
 		selectedMsg := writeCmd()

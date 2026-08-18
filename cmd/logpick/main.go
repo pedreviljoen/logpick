@@ -29,6 +29,7 @@ func newRootCmd() *cobra.Command {
 	}
 	root.SetVersionTemplate("logpick {{.Version}}\n")
 	root.AddCommand(newScanCmd())
+	wireTUI(root)
 	return root
 }
 

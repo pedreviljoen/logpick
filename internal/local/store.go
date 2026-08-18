@@ -96,6 +96,34 @@ func New(root string) *Store {
 	return &Store{root: root}
 }
 
+// AbsPath returns the absolute local path for local, a path relative to
+// s's root exactly as state.Fetch.Local stores it (that field's own doc
+// comment). It performs no I/O: it exists so a caller that only has the
+// root-relative string out of state.toml - the library screen's load path
+// in cmd/logpick, recovering the absolute path ui.FetchedFile.Local
+// documents - never has to reach into Store's unexported root field.
+func (s *Store) AbsPath(local string) string {
+	return filepath.Join(s.root, local)
+}
+
+// Delete removes the file at abs, an absolute path previously returned by
+// AbsPath or PathFor, from disk. It is declarative, the same way
+// state.Store.Remove and state.Store.Pin are: deleting a path that is
+// already gone is not an error, so a delete keystroke repeated on a stale
+// library row is not a failure.
+//
+// Delete does not touch state.toml. Removing the matching state.Fetch
+// record is the caller's job (cmd/logpick's library DeleteFunc does both,
+// in that order), because this package has no dependency on
+// internal/state (DESIGN.md 9.2) and Store.Fetch above already shows the
+// pattern of a *state.Store passed in by the caller rather than held here.
+func (s *Store) Delete(abs string) error {
+	if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("deleting %s: %w", abs, err)
+	}
+	return nil
+}
+
 // PathFor returns the absolute local destination for a file fetched from
 // remote on host at time at, per DESIGN.md 10.1's layout:
 //

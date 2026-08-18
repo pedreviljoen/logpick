@@ -29,6 +29,13 @@ type ScanEntry struct {
 	Size int64
 	// ModTime is the last modification time, the default sort key.
 	ModTime time.Time
+	// IsDir reports whether the entry is a directory rather than a log
+	// file. It is always false for a configured discovery scan, which
+	// matches regular files only, and can be true only in the unfiltered
+	// listing a PathScanRequestedMsg produces. A screen must not preview
+	// or fetch an entry with IsDir set: it is somewhere to look, not
+	// something to read.
+	IsDir bool
 }
 
 // HostSummary is one row of the host history. It mirrors the per-host record in
@@ -246,14 +253,27 @@ type ScanDoneMsg struct {
 	Truncated bool
 }
 
-// PathScanRequestedMsg asks the composition layer to run discovery against a
-// one-off remote path while retaining the active profile's other scan rules.
+// PathScanRequestedMsg asks the composition layer to list a one-off remote
+// path: the escape hatch for a log the configured scan did not turn up.
+//
+// The listing it asks for is deliberately unfiltered - every file and every
+// directory under Path, with the profile's include and exclude patterns
+// ignored - so the user can fuzzy-find their way to the file by name. The
+// profile's log patterns are what hid the file in the first place, so
+// re-applying them here would reproduce the empty list the user is trying
+// to escape.
+//
+// Sent by the browser: from Ctrl+S with a typed path, and from Enter on a
+// directory in a listing, which is how the user descends into one. Handled
+// by the composition layer, which replies with PathScanStartedMsg and then
+// the usual ScanEntriesMsg/ScanDoneMsg stream.
 type PathScanRequestedMsg struct {
 	Host string
 	Path string
 }
 
-// PathScanStartedMsg clears the browser list for a one-off path scan.
+// PathScanStartedMsg clears the browser list for a one-off path listing and
+// switches it into browse mode, where entries may be directories.
 type PathScanStartedMsg struct {
 	Host string
 	Path string

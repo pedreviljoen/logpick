@@ -49,6 +49,29 @@ type Entry struct {
 	// and documented here rather than silently masked by a fabricated
 	// timestamp.
 	ModTime time.Time
+	// IsDir reports whether the entry is a directory rather than a
+	// regular file.
+	//
+	// A discovery scan (BuildScan, discover.go) passes `-type f` and so
+	// never produces a directory: every Entry it yields has IsDir false.
+	// A browse listing (BuildBrowse) drops that filter deliberately, so
+	// the browser can offer the whole tree - directories included - as a
+	// fuzzy-findable list when a configured scan missed the log the user
+	// was after.
+	//
+	// The two dialects mark a directory differently, and both marks are
+	// read here rather than by any caller:
+	//
+	//   - GNU input: BuildBrowse's directory branch prints a trailing '/'
+	//     after %p. ParseScan strips that slash before it ever reaches
+	//     Path, so a directory's Path is its plain path with no trailing
+	//     separator, exactly like a file's.
+	//   - BSD input: `ls -ldn` writes the file type in the first
+	//     character of the mode column, 'd' for a directory.
+	//
+	// Reading both marks unconditionally is safe for a discovery scan
+	// too: `-type f` output can carry neither one.
+	IsDir bool
 }
 
 // Report summarises one call to ParseScan.
@@ -242,6 +265,11 @@ const scanBufferMax = 1 << 20 // 1MB
 // size, month, day, time-or-year.
 const bsdFixedFields = 8
 
+// bsdModeField is the index, within the fields bsdSplitFields returns, of
+// the mode column, whose first character is the file type: 'd' for a
+// directory, '-' for a regular file (see Entry.IsDir).
+const bsdModeField = 0
+
 // bsdSizeField is the index, within the fields bsdSplitFields returns, of
 // the file size column.
 const bsdSizeField = 4
@@ -271,7 +299,17 @@ func parseGNULine(line string) (Entry, bool) {
 		return Entry{}, false
 	}
 
-	return Entry{Path: path, Size: size, ModTime: modTime}, true
+	// BuildBrowse marks a directory with a trailing slash (see
+	// Entry.IsDir). Strip exactly one, and only when something is left
+	// behind, so the filesystem root "/" printed as "//" comes back as
+	// "/" rather than "".
+	isDir := false
+	if len(path) > 1 && strings.HasSuffix(path, "/") {
+		isDir = true
+		path = strings.TrimSuffix(path, "/")
+	}
+
+	return Entry{Path: path, Size: size, ModTime: modTime, IsDir: isDir}, true
 }
 
 // parseEpoch parses find's %T@ field: Unix epoch seconds with a
@@ -320,7 +358,7 @@ func parseBSDLine(line string) (Entry, bool) {
 		return Entry{}, false
 	}
 
-	return Entry{Path: path, Size: size}, true
+	return Entry{Path: path, Size: size, IsDir: strings.HasPrefix(fields[bsdModeField], "d")}, true
 }
 
 // bsdSplitFields consumes n whitespace-separated fields from the left of

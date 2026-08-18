@@ -111,14 +111,7 @@ func BuildScan(spec config.ScanSpec, gnuFind bool) string {
 	}
 
 	field("find")
-
-	for _, p := range spec.Paths {
-		if strings.ContainsAny(p, "*?[") {
-			field(p)
-		} else {
-			field(Quote(p))
-		}
-	}
+	writePaths(field, spec.Paths)
 
 	if spec.MaxDepth > 0 {
 		field("-maxdepth")
@@ -149,6 +142,110 @@ func BuildScan(spec config.ScanSpec, gnuFind bool) string {
 	if gnuFind {
 		field("-printf")
 		field(`'%s\t%T@\t%p\n'`)
+	} else {
+		field("-exec")
+		field("ls")
+		field("-ldn")
+		field("--")
+		field("{}")
+		field("+")
+	}
+
+	field("2>/dev/null")
+
+	return b.String()
+}
+
+// writePaths emits spec.Paths as the root arguments of a find command,
+// using the quoting rule BuildScan documents under "Paths": a path
+// containing a glob metacharacter goes out unquoted so the remote shell
+// expands it, anything else goes through Quote so spaces and punctuation
+// survive. BuildScan and BuildBrowse share it so the two can never drift
+// into quoting the same path differently.
+func writePaths(field func(string), paths []string) {
+	for _, p := range paths {
+		if strings.ContainsAny(p, "*?[") {
+			field(p)
+		} else {
+			field(Quote(p))
+		}
+	}
+}
+
+// BuildBrowse builds the `find` command behind the browser's one-off path
+// scan: the listing shown when discovery did not turn up the log the user
+// was after and they name a path themselves (DESIGN.md 8.3, "when the
+// configured paths are wrong").
+//
+// It differs from BuildScan in exactly two ways, both deliberate:
+//
+//   - No `-type f`, so directories are listed alongside regular files. A
+//     user who names a path they are unsure about wants to see what is
+//     actually there, including the subdirectory the logs really live in,
+//     and the browser lets them descend into one.
+//   - No include or exclude clause. spec.Include and spec.Exclude are
+//     ignored entirely rather than applied, because the profile's log
+//     patterns are the very thing that hid the file: re-applying them to
+//     a hand-typed path would reproduce the empty list the user is trying
+//     to escape.
+//
+// spec.Paths and spec.MaxDepth are honoured exactly as BuildScan honours
+// them, including the two contracts documented there: empty Paths returns
+// "" and the caller must skip the exec rather than run a bare find, and
+// MaxDepth <= 0 means unlimited depth rather than `-maxdepth 0`.
+//
+// # Output clause
+//
+// gnuFind selects the same two dialects BuildScan selects between, with
+// the directory mark Entry.IsDir documents:
+//
+//	\( -type d -printf '%s\t%T@\t%p/\n' -o -printf '%s\t%T@\t%p\n' \)
+//
+// The group is one find expression: a directory matches `-type d` and is
+// printed with a trailing slash, anything else falls through the `-o` to
+// the plain form. The fields either branch prints are byte for byte
+// BuildScan's, so ParseScan needs no separate browse format.
+//
+// The BSD fallback is `-exec ls -ldn -- {} +` unchanged. `-d` already
+// makes ls describe a directory itself rather than list its contents, and
+// its mode column starts with 'd', which is the mark ParseScan reads
+// there.
+//
+// As in BuildScan the command always ends `2>/dev/null`: browsing an
+// unreadable tree is routine and must not surface as an error.
+func BuildBrowse(spec config.ScanSpec, gnuFind bool) string {
+	if len(spec.Paths) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	first := true
+	field := func(s string) {
+		if !first {
+			b.WriteByte(' ')
+		}
+		first = false
+		b.WriteString(s)
+	}
+
+	field("find")
+	writePaths(field, spec.Paths)
+
+	if spec.MaxDepth > 0 {
+		field("-maxdepth")
+		field(strconv.Itoa(spec.MaxDepth))
+	}
+
+	if gnuFind {
+		field(`\(`)
+		field("-type")
+		field("d")
+		field("-printf")
+		field(`'%s\t%T@\t%p/\n'`)
+		field("-o")
+		field("-printf")
+		field(`'%s\t%T@\t%p\n'`)
+		field(`\)`)
 	} else {
 		field("-exec")
 		field("ls")

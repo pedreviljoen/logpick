@@ -55,6 +55,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/pedreviljoen/logpick/internal/config"
@@ -293,4 +294,111 @@ func TestNewApp(t *testing.T) {
 			t.Fatalf("active screen = %v, want %v", app.Active, ui.ScreenHosts)
 		}
 	})
+}
+
+// TestScanPathListsEverythingUnderTheTypedPath is the escape hatch a user
+// reaches for when the configured scan did not turn up the log they know is
+// there (ui.PathScanRequestedMsg): the profile's include and exclude
+// patterns are what hid it, so a one-off listing must drop them, and must
+// list directories too, so the user can descend.
+func TestScanPathListsEverythingUnderTheTypedPath(t *testing.T) {
+	const host = "jenkins-01.prod.internal"
+
+	deps := testDeps(t, host)
+	// A profile narrow enough to hide every fixture but *.log, which is
+	// exactly the situation the one-off listing exists to escape.
+	deps.Host.Profile.Scan = config.ScanSpec{
+		Paths:   []string{"/var/log"},
+		Include: []string{"*.log"},
+		Exclude: []string{"*.gz"},
+	}
+
+	m := tuiModel{active: deps, ctx: context.Background(), errc: make(chan error, 1)}
+	next, cmd := m.scanPath(ui.PathScanRequestedMsg{Host: host, Path: "  /opt/app/logs  "})
+	if cmd == nil {
+		t.Fatal("scanPath returned nil Cmd")
+	}
+	if _, ok := next.(tuiModel); !ok {
+		t.Fatalf("scanPath returned %T, want tuiModel", next)
+	}
+
+	// tea.Batch's message is not one of ours to inspect, so the probe and
+	// start messages are exercised through the model's own Update: the
+	// scanReadyMsg is what carries the spec the scan will actually run.
+	ready := scanReadyMsg{}
+	found := false
+	for _, msg := range batchMessages(t, cmd) {
+		switch v := msg.(type) {
+		case ui.PathScanStartedMsg:
+			want := ui.PathScanStartedMsg{Host: host, Path: "/opt/app/logs"}
+			if diff := cmp.Diff(want, v); diff != "" {
+				t.Errorf("PathScanStartedMsg mismatch (-want +got):\n%s", diff)
+			}
+		case scanReadyMsg:
+			ready, found = v, true
+		case ui.ErrorMsg:
+			t.Fatalf("scanPath reported %v", v.Err)
+		}
+	}
+	if !found {
+		t.Fatal("scanPath never produced a scanReadyMsg")
+	}
+	if !ready.Browse {
+		t.Error("scanReadyMsg.Browse = false, want true: a typed path is browsed, not scanned")
+	}
+	want := config.ScanSpec{Paths: []string{"/opt/app/logs"}}
+	if diff := cmp.Diff(want, ready.Deps.Host.Profile.Scan); diff != "" {
+		t.Errorf("one-off scan spec mismatch (-want +got):\n%s", diff)
+	}
+
+	// And the scan that spec drives lists directories alongside the files
+	// the profile's patterns would have excluded.
+	entries := make(chan remote.Entry)
+	report := make(chan remote.Report, 1)
+	go func() {
+		if err := scanRun(ready.Deps, ready.GNUFind, ready.Browse, entries, report)(context.Background()); err != nil {
+			t.Errorf("scanRun: %v", err)
+		}
+	}()
+
+	dirs, files := map[string]bool{}, map[string]bool{}
+	for e := range entries {
+		if e.IsDir {
+			dirs[e.Path] = true
+			continue
+		}
+		files[e.Path] = true
+	}
+	if !dirs["/opt/app/logs/archive"] {
+		t.Errorf("listing has no directories, got %v", dirs)
+	}
+	if !files["/opt/app/logs/gc.log.gz"] {
+		t.Errorf("listing did not include the excluded gc.log.gz, got %v", files)
+	}
+	if rep := <-report; rep.Count != len(dirs)+len(files) {
+		t.Errorf("report Count = %d, want %d", rep.Count, len(dirs)+len(files))
+	}
+}
+
+// batchMessages runs cmd and returns every message it produced, flattening
+// the tea.BatchMsg a tea.Batch returns into the individual messages its
+// commands report. A nil message (a command whose only job is a side
+// effect) is dropped.
+func batchMessages(t *testing.T, cmd tea.Cmd) []tea.Msg {
+	t.Helper()
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		return []tea.Msg{msg}
+	}
+	out := make([]tea.Msg, 0, len(batch))
+	for _, c := range batch {
+		if c == nil {
+			continue
+		}
+		if inner := c(); inner != nil {
+			out = append(out, inner)
+		}
+	}
+	return out
 }

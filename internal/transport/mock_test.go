@@ -125,10 +125,23 @@ func gnuScanLine(t *testing.T, rel, remote string) string {
 // the fixture at rel, reporting as remote.
 func bsdScanLine(t *testing.T, rel, remote string) string {
 	t.Helper()
+	return bsdLine(t, rel, remote, "-rw-r--r--")
+}
+
+// bsdDirLine is bsdScanLine for a directory in a browse listing: the same
+// line with the mode column's leading 'd', which is how the BSD dialect
+// marks a directory (mock.go's "Recognised shapes", T10's Entry.IsDir).
+func bsdDirLine(t *testing.T, rel, remote string) string {
+	t.Helper()
+	return bsdLine(t, rel, remote, "drwxr-xr-x")
+}
+
+func bsdLine(t *testing.T, rel, remote, mode string) string {
+	t.Helper()
 	info := statFixture(t, rel)
 	mt := info.ModTime()
-	return fmt.Sprintf("-rw-r--r-- 1 501 20 %d %s %d %02d:%02d %s\n",
-		info.Size(), mt.Format("Jan"), mt.Day(), mt.Hour(), mt.Minute(), remote)
+	return fmt.Sprintf("%s 1 501 20 %d %s %d %02d:%02d %s\n",
+		mode, info.Size(), mt.Format("Jan"), mt.Day(), mt.Hour(), mt.Minute(), remote)
 }
 
 // lastNLines reproduces GNU tail -n's output for the fixture at rel.
@@ -486,4 +499,73 @@ func TestMockLatencyCancellable(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Exec with an already-cancelled ctx returned %v, want context.Canceled", err)
 	}
+}
+
+// TestMockBrowseListing covers the browse shape T09's BuildBrowse emits:
+// the same find command with no "-type f" and no name patterns, so
+// directories are listed alongside files. It is part of mechanic 1 - a
+// recognised shape returning the expected content - but lives in its own
+// test because what makes it a browse is the *absence* of clauses the other
+// scan cases assert the presence of.
+func TestMockBrowseListing(t *testing.T) {
+	const browseRoot = "opt/app/logs"
+
+	t.Run("gnu marks directories with a trailing slash", func(t *testing.T) {
+		m := newMock(t)
+		cmd := `find '/opt/app/logs' \( -type d -printf '%s\t%T@\t%p/\n' -o -printf '%s\t%T@\t%p\n' \) 2>/dev/null`
+
+		proc, err := m.Exec(context.Background(), cmd)
+		if err != nil {
+			t.Fatalf("Exec: %v", err)
+		}
+		got := drain(t, proc)
+		if err := proc.Wait(); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		// The root itself is listed, exactly as a real find lists it, and
+		// gc.log.gz and empty.log appear even though the profile that
+		// hid them excludes "*.gz" and includes only "*.log".
+		want := gnuScanLine(t, browseRoot, "/opt/app/logs/") +
+			gnuScanLine(t, "opt/app/logs/app.log", "/opt/app/logs/app.log") +
+			gnuScanLine(t, "opt/app/logs/app.log.1", "/opt/app/logs/app.log.1") +
+			gnuScanLine(t, "opt/app/logs/archive", "/opt/app/logs/archive/") +
+			gnuScanLine(t, "opt/app/logs/archive/2024", "/opt/app/logs/archive/2024/") +
+			gnuScanLine(t, "opt/app/logs/archive/2024/08", "/opt/app/logs/archive/2024/08/") +
+			gnuScanLine(t, "opt/app/logs/archive/2024/08/15", "/opt/app/logs/archive/2024/08/15/") +
+			gnuScanLine(t, "opt/app/logs/archive/2024/08/15/worker", "/opt/app/logs/archive/2024/08/15/worker/") +
+			gnuScanLine(t, "opt/app/logs/archive/2024/08/15/worker/deep", "/opt/app/logs/archive/2024/08/15/worker/deep/") +
+			gnuScanLine(t, "opt/app/logs/archive/2024/08/15/worker/deep/nested.log", "/opt/app/logs/archive/2024/08/15/worker/deep/nested.log") +
+			gnuScanLine(t, "opt/app/logs/empty.log", "/opt/app/logs/empty.log") +
+			gnuScanLine(t, "opt/app/logs/gc.log.gz", "/opt/app/logs/gc.log.gz")
+
+		if diff := cmp.Diff(want, string(got)); diff != "" {
+			t.Errorf("browse output mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("bsd marks directories in the mode column", func(t *testing.T) {
+		m := newMock(t)
+		cmd := `find '/opt/app/logs' -maxdepth 1 -exec ls -ldn -- {} + 2>/dev/null`
+
+		proc, err := m.Exec(context.Background(), cmd)
+		if err != nil {
+			t.Fatalf("Exec: %v", err)
+		}
+		got := drain(t, proc)
+		if err := proc.Wait(); err != nil {
+			t.Fatalf("Wait: %v", err)
+		}
+
+		want := bsdDirLine(t, browseRoot, "/opt/app/logs") +
+			bsdScanLine(t, "opt/app/logs/app.log", "/opt/app/logs/app.log") +
+			bsdScanLine(t, "opt/app/logs/app.log.1", "/opt/app/logs/app.log.1") +
+			bsdDirLine(t, "opt/app/logs/archive", "/opt/app/logs/archive") +
+			bsdScanLine(t, "opt/app/logs/empty.log", "/opt/app/logs/empty.log") +
+			bsdScanLine(t, "opt/app/logs/gc.log.gz", "/opt/app/logs/gc.log.gz")
+
+		if diff := cmp.Diff(want, string(got)); diff != "" {
+			t.Errorf("browse output mismatch (-want +got):\n%s", diff)
+		}
+	})
 }

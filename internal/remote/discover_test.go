@@ -250,3 +250,103 @@ func assertEndsWithDevNullRedirect(t *testing.T, got string) {
 		t.Errorf("BuildScan output %q does not end with %q", got, want)
 	}
 }
+
+// TestBuildBrowse covers the browse listing behind the browser's one-off
+// path scan. It is the same five mechanics as BuildScan above, minus the
+// include/exclude one, which becomes its own assertion here precisely
+// because BuildBrowse's contract is that those patterns are *not* emitted.
+func TestBuildBrowse_GNUvsBSD(t *testing.T) {
+	spec := config.ScanSpec{Paths: []string{"/opt/app", "/srv/logs"}}
+
+	tests := []struct {
+		name    string
+		gnuFind bool
+		want    string
+	}{
+		{
+			name:    "GNU mode prints directories with a trailing slash",
+			gnuFind: true,
+			want:    `find '/opt/app' '/srv/logs' \( -type d -printf '%s\t%T@\t%p/\n' -o -printf '%s\t%T@\t%p\n' \) 2>/dev/null`,
+		},
+		{
+			name:    "BSD mode reuses the ls -ldn form unchanged",
+			gnuFind: false,
+			want:    `find '/opt/app' '/srv/logs' -exec ls -ldn -- {} + 2>/dev/null`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BuildBrowse(spec, tt.gnuFind)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("BuildBrowse mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestBuildBrowse_NoTypeOrNameFilters is the whole point of the function
+// existing separately from BuildScan: the profile's log patterns are what
+// hid the file the user is now looking for by hand, so neither they nor
+// -type f may appear in the command.
+func TestBuildBrowse_NoTypeOrNameFilters(t *testing.T) {
+	spec := config.ScanSpec{
+		Paths:   []string{"/opt/app"},
+		Include: []string{"*.log"},
+		Exclude: []string{"*.gz"},
+	}
+
+	for _, gnuFind := range []bool{true, false} {
+		got := BuildBrowse(spec, gnuFind)
+		for _, unwanted := range []string{"-type f", "-name", "*.log", "*.gz"} {
+			if strings.Contains(got, unwanted) {
+				t.Errorf("BuildBrowse(gnuFind=%v) = %q, must not contain %q", gnuFind, got, unwanted)
+			}
+		}
+		if !strings.HasSuffix(got, "2>/dev/null") {
+			t.Errorf("BuildBrowse(gnuFind=%v) = %q, want it to end with 2>/dev/null", gnuFind, got)
+		}
+	}
+}
+
+func TestBuildBrowse_PathsAndDepth(t *testing.T) {
+	tests := []struct {
+		name string
+		spec config.ScanSpec
+		want string
+	}{
+		{
+			name: "no paths is nothing to list, exactly as BuildScan",
+			spec: config.ScanSpec{},
+			want: "",
+		},
+		{
+			name: "a glob path is left unquoted so the remote shell expands it",
+			spec: config.ScanSpec{Paths: []string{"/srv/*/logs"}},
+			want: `find /srv/*/logs \( -type d -printf '%s\t%T@\t%p/\n' -o -printf '%s\t%T@\t%p\n' \) 2>/dev/null`,
+		},
+		{
+			name: "a path with a space survives quoting",
+			spec: config.ScanSpec{Paths: []string{"/var/log/app name"}},
+			want: `find '/var/log/app name' \( -type d -printf '%s\t%T@\t%p/\n' -o -printf '%s\t%T@\t%p\n' \) 2>/dev/null`,
+		},
+		{
+			name: "a positive MaxDepth is emitted before the output clause",
+			spec: config.ScanSpec{Paths: []string{"/opt/app"}, MaxDepth: 2},
+			want: `find '/opt/app' -maxdepth 2 \( -type d -printf '%s\t%T@\t%p/\n' -o -printf '%s\t%T@\t%p\n' \) 2>/dev/null`,
+		},
+		{
+			name: "a zero MaxDepth omits -maxdepth rather than emitting -maxdepth 0",
+			spec: config.ScanSpec{Paths: []string{"/opt/app"}},
+			want: `find '/opt/app' \( -type d -printf '%s\t%T@\t%p/\n' -o -printf '%s\t%T@\t%p\n' \) 2>/dev/null`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if diff := cmp.Diff(tt.want, BuildBrowse(tt.spec, true)); diff != "" {
+				t.Errorf("BuildBrowse mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}

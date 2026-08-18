@@ -265,26 +265,7 @@ func (m Model[T]) View() string {
 			b.WriteString("  ")
 		}
 
-		display := truncateRow(match.Str, m.width-2)
-		if len(match.MatchedIndexes) == 0 {
-			b.WriteString(display)
-			b.WriteByte('\n')
-			continue
-		}
-
-		highlighted := make(map[int]bool, len(match.MatchedIndexes))
-		for _, idx := range match.MatchedIndexes {
-			highlighted[idx] = true
-		}
-		for j, r := range display {
-			if highlighted[j] {
-				b.WriteByte('[')
-				b.WriteRune(r)
-				b.WriteByte(']')
-			} else {
-				b.WriteRune(r)
-			}
-		}
+		b.WriteString(markedRow(match.Str, match.MatchedIndexes, m.width-2))
 		b.WriteByte('\n')
 	}
 
@@ -347,14 +328,63 @@ func (m Model[T]) SetHeight(height int) Model[T] {
 }
 
 // SetWidth bounds each rendered row and the filter input to width cells.
+//
+// The input is given three columns less than width, not two: textinput
+// renders its two-column prompt, then the value padded to its own Width,
+// then one more cell for the cursor. Budgeting only for the prompt leaves
+// the query line one column wider than every row beneath it, which a
+// fixed-width pane resolves by wrapping it - costing a row, or misaligning
+// the pane against its neighbour - as soon as a query is long enough that
+// the overflowing cell is not blank.
 func (m Model[T]) SetWidth(width int) Model[T] {
 	m.width = width
-	inputWidth := width - 2
+	inputWidth := width - 3
 	if inputWidth < 1 {
 		inputWidth = 1
 	}
 	m.input.Width = inputWidth
 	return m
+}
+
+// markedRow renders one row: value with each matched rune wrapped in
+// brackets, clipped to width columns.
+//
+// The clip happens last, after the brackets are in, and that ordering is
+// the whole point of this function. Bracketing costs two extra columns per
+// matched rune, so a row truncated first and bracketed after is up to
+// 2*len(matched) columns wider than the width it was truncated to. The
+// caller renders these rows inside a fixed-width pane, which wraps
+// whatever overflows: one query matching a dozen characters turned every
+// row into three, and a list taller than its container pushed its own
+// border off the bottom of the screen.
+//
+// Bracket indices are rune indices, matching what fuzzy.Find reports.
+// Ranging over a string yields byte offsets, so the runes are indexed
+// explicitly; the two agree only while every character is ASCII, and a
+// remote path is not required to be.
+func markedRow(value string, matched []int, width int) string {
+	if len(matched) == 0 {
+		return truncateRow(value, width)
+	}
+
+	highlighted := make(map[int]bool, len(matched))
+	for _, idx := range matched {
+		highlighted[idx] = true
+	}
+
+	runes := []rune(value)
+	var b strings.Builder
+	b.Grow(len(value) + 2*len(matched))
+	for i, r := range runes {
+		if highlighted[i] {
+			b.WriteByte('[')
+			b.WriteRune(r)
+			b.WriteByte(']')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return truncateRow(b.String(), width)
 }
 
 func truncateRow(value string, width int) string {

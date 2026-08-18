@@ -537,9 +537,11 @@ func execLines(ctx context.Context, t transport.Transport, cmd string) ([]string
 }
 
 // scanRun execs the find command remote.BuildScan builds for
-// d.Host.Profile.Scan and gnuFind, and streams every remote.Entry
-// remote.ParseScan produces on entries as it parses them, sending the
-// final remote.Report on report exactly once before closing both channels.
+// d.Host.Profile.Scan and gnuFind - or, with browse set, the unfiltered
+// listing remote.BuildBrowse builds for that same spec - and streams every
+// remote.Entry remote.ParseScan produces on entries as it parses them,
+// sending the final remote.Report on report exactly once before closing
+// both channels.
 //
 // It is shaped for ui.SafeGo - func(context.Context) error - so the
 // goroutine it runs in is cancellable via ctx and any panic inside it is
@@ -554,9 +556,13 @@ func execLines(ctx context.Context, t transport.Transport, cmd string) ([]string
 // both channels with a zero remote.Report and return nil without ever
 // calling d.Transport.Exec, the same rule runScan (scan.go) already
 // follows for the non-TUI path.
-func scanRun(d appDeps, gnuFind bool, entries chan<- remote.Entry, report chan<- remote.Report) func(ctx context.Context) error {
+func scanRun(d appDeps, gnuFind, browse bool, entries chan<- remote.Entry, report chan<- remote.Report) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
-		cmd := remote.BuildScan(d.Host.Profile.Scan, gnuFind)
+		build := remote.BuildScan
+		if browse {
+			build = remote.BuildBrowse
+		}
+		cmd := build(d.Host.Profile.Scan, gnuFind)
 		if cmd == "" {
 			close(entries)
 			report <- remote.Report{}
@@ -648,7 +654,7 @@ func scanDrainCmd(host string, entries <-chan remote.Entry, report <-chan remote
 // (msg.go documents the two as meant to become type aliases of one
 // another; until they are, this is the conversion).
 func toUIScanEntry(e remote.Entry) ui.ScanEntry {
-	return ui.ScanEntry{Path: e.Path, Size: e.Size, ModTime: e.ModTime}
+	return ui.ScanEntry{Path: e.Path, Size: e.Size, ModTime: e.ModTime, IsDir: e.IsDir}
 }
 
 // followCmd starts a follow stream for path on host: it calls
@@ -1111,6 +1117,10 @@ type scanReadyMsg struct {
 	Host    string
 	Deps    appDeps
 	GNUFind bool
+	// Browse selects remote.BuildBrowse over remote.BuildScan: the
+	// unfiltered listing behind ui.PathScanRequestedMsg rather than the
+	// profile's configured log discovery.
+	Browse bool
 }
 
 func (m tuiModel) selectHost(msg ui.HostSelectedMsg) (tea.Model, tea.Cmd) {
@@ -1185,8 +1195,15 @@ func (m tuiModel) scanPath(msg ui.PathScanRequestedMsg) (tea.Model, tea.Cmd) {
 		m.scanCancel()
 	}
 
+	path := strings.TrimSpace(msg.Path)
 	deps := m.active
-	deps.Host.Profile.Scan.Paths = []string{strings.TrimSpace(msg.Path)}
+	// A one-off listing keeps the host's transport and nothing else about
+	// its scan rules: only the typed path, at unlimited depth, with the
+	// profile's include and exclude patterns dropped. Those patterns are
+	// what hid the file the user is now hunting for by hand, so applying
+	// them again would hand back the same empty list
+	// (ui.PathScanRequestedMsg).
+	deps.Host.Profile.Scan = config.ScanSpec{Paths: []string{path}}
 	host := msg.Host
 	ctx := m.ctx
 	probeCmd := func() tea.Msg {
@@ -1194,13 +1211,13 @@ func (m tuiModel) scanPath(msg ui.PathScanRequestedMsg) (tea.Model, tea.Cmd) {
 		if err != nil {
 			return ui.ErrorMsg{Err: fmt.Errorf("probing %q: %w", host, err)}
 		}
-		return scanReadyMsg{Host: host, Deps: deps, GNUFind: gnuFind}
+		return scanReadyMsg{Host: host, Deps: deps, GNUFind: gnuFind, Browse: true}
 	}
 
 	next := m
 	next.app.Err = nil
 	return next, tea.Batch(
-		func() tea.Msg { return ui.PathScanStartedMsg{Host: host, Path: msg.Path} },
+		func() tea.Msg { return ui.PathScanStartedMsg{Host: host, Path: path} },
 		probeCmd,
 	)
 }
@@ -1230,7 +1247,7 @@ func (m tuiModel) startScan(msg scanReadyMsg) (tea.Model, tea.Cmd) {
 	next.scanEntries = entries
 	next.scanReport = report
 
-	ui.SafeGo(scanCtx, next.errc, scanRun(msg.Deps, msg.GNUFind, entries, report))
+	ui.SafeGo(scanCtx, next.errc, scanRun(msg.Deps, msg.GNUFind, msg.Browse, entries, report))
 
 	return next, scanDrainCmd(msg.Host, entries, report)
 }

@@ -424,3 +424,196 @@ func TestModel_MovingSelectionCancelsInFlightPreview(t *testing.T) {
 		}
 	})
 }
+
+// dirEntry builds a directory ui.ScanEntry, the kind only a one-off listing
+// (ui.PathScanRequestedMsg) can produce.
+func dirEntry(path string) ui.ScanEntry {
+	return ui.ScanEntry{Path: path, Size: 4096, ModTime: time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC), IsDir: true}
+}
+
+// browsing drives m into browse mode showing entries, the state the browser
+// is in after the user typed a path with ctrl+s and the listing came back.
+func browsing(t *testing.T, m browser.Model, path string, entries []ui.ScanEntry) browser.Model {
+	t.Helper()
+	m, _ = update(t, m, ui.PathScanStartedMsg{Host: testHost, Path: path})
+	m, _ = update(t, m, ui.ScanEntriesMsg{Host: testHost, Entries: entries})
+	return m
+}
+
+// TestModel_ListingShowsDirectoriesWithATrailingSlash covers the one place a
+// directory can be told apart in the list: picker renders the same string it
+// filtered on, so the trailing slash is both the mark and the fuzzy-match
+// text, while Highlighted still reports the plain path the remote knows.
+func TestModel_ListingShowsDirectoriesWithATrailingSlash(t *testing.T) {
+	entries := append([]ui.ScanEntry{dirEntry("/opt/app/archive")}, entriesFor("/opt/app/app.log")...)
+	m := browsing(t, browser.New(testHost, noopPreview), "/opt/app", entries)
+
+	got, ok := m.Highlighted()
+	if !ok {
+		t.Fatal("no entry highlighted after the listing arrived")
+	}
+	if got.Path != "/opt/app/archive" || !got.IsDir {
+		t.Fatalf("highlighted %+v, want the directory /opt/app/archive", got)
+	}
+
+	view := m.View()
+	if !strings.Contains(view, "/opt/app/archive/") {
+		t.Errorf("view does not render the directory with a trailing slash:\n%s", view)
+	}
+	if !strings.Contains(view, "Browsing — /opt/app") {
+		t.Errorf("view does not name the path being browsed:\n%s", view)
+	}
+}
+
+// TestModel_NoPreviewRequestForADirectory: a directory has nothing to tail,
+// so highlighting one must not burn a request or leave the pane claiming to
+// be loading one.
+func TestModel_NoPreviewRequestForADirectory(t *testing.T) {
+	m := browser.New(testHost, noopPreview, browser.WithDebounce(time.Millisecond))
+	m = browsing(t, m, "/opt/app", []ui.ScanEntry{dirEntry("/opt/app/archive")})
+
+	if m.PreviewRequestCount() != 0 {
+		t.Fatalf("PreviewRequestCount = %d, want 0", m.PreviewRequestCount())
+	}
+	// Even a debounce tick that somehow arrives for the directory must not
+	// reach PreviewFunc: nothing issued one, so its generation is stale.
+	before := m.PreviewRequestCount()
+	m, _ = update(t, m, ui.PreviewDebounceMsg{Gen: m.Gen(), Host: testHost, Path: "/opt/app/archive/"})
+	if m.PreviewRequestCount() != before {
+		t.Errorf("PreviewRequestCount = %d after a directory debounce, want %d", m.PreviewRequestCount(), before)
+	}
+}
+
+// TestModel_EnterOnADirectoryDescendsIntoIt is how a user walks the tree
+// after a listing: enter on a directory is the same request ctrl+s makes,
+// for the child path, so the browser can drill down without retyping it.
+func TestModel_EnterOnADirectoryDescendsIntoIt(t *testing.T) {
+	entries := []ui.ScanEntry{dirEntry("/opt/app/archive")}
+	m := browsing(t, browser.New(testHost, noopPreview), "/opt/app", entries)
+
+	for _, key := range []tea.KeyType{tea.KeyEnter, tea.KeySpace} {
+		_, cmd := update(t, m, tea.KeyMsg{Type: key})
+		if cmd == nil {
+			t.Fatalf("%v on a directory returned nil Cmd", key)
+		}
+		raw := cmd()
+		msg, ok := raw.(ui.PathScanRequestedMsg)
+		if !ok {
+			t.Fatalf("%v on a directory produced %T, want ui.PathScanRequestedMsg", key, raw)
+		}
+		// The remote is asked for the plain path: the trailing slash the
+		// list renders is a display mark and must not leak into a command.
+		want := ui.PathScanRequestedMsg{Host: testHost, Path: "/opt/app/archive"}
+		if diff := cmp.Diff(want, msg); diff != "" {
+			t.Errorf("%v request mismatch (-want +got):\n%s", key, diff)
+		}
+	}
+}
+
+// TestModel_EnterOnAFileFetchesItLikeSpace: enter commits the highlighted
+// row, and for a log that means the same local snapshot Space fetches.
+func TestModel_EnterOnAFileFetchesItLikeSpace(t *testing.T) {
+	const remotePath = "/opt/app/app.log"
+	selected := make(chan string, 1)
+	m := browser.New(testHost, noopPreview, browser.WithSelector(
+		func(_ context.Context, _ string, entry ui.ScanEntry) (string, []string, error) {
+			selected <- entry.Path
+			return "/tmp/logpick/app.log", []string{"line one"}, nil
+		},
+	))
+	m = browsing(t, m, "/opt/app", entriesFor(remotePath))
+
+	_, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("enter on a file returned nil Cmd")
+	}
+	cmd()
+	select {
+	case got := <-selected:
+		if got != remotePath {
+			t.Errorf("selector fetched %q, want %q", got, remotePath)
+		}
+	default:
+		t.Fatal("enter on a file did not reach the selector")
+	}
+}
+
+// TestModel_EmptyListingSaysSo: the whole reason a user types a path is that
+// the configured scan found nothing, so a listing that also finds nothing
+// has to read as an answer rather than as a list still loading.
+func TestModel_EmptyListingSaysSo(t *testing.T) {
+	m := browser.New(testHost, noopPreview).Resize(100, 30)
+	bm, ok := m.(browser.Model)
+	if !ok {
+		t.Fatalf("Resize returned %T, want browser.Model", m)
+	}
+	bm, _ = update(t, bm, ui.PathScanStartedMsg{Host: testHost, Path: "/nope"})
+	bm, _ = update(t, bm, ui.ScanDoneMsg{Host: testHost})
+
+	if view := bm.View(); !strings.Contains(view, "Nothing readable here") {
+		t.Errorf("empty listing view does not say the path was empty:\n%s", view)
+	}
+}
+
+// TestModel_ViewFitsItsTerminalAtEverySize is the regression test for the
+// screen coming apart once the file list outgrew its pane. Three separate
+// defects each broke the frame the same way - by rendering content taller
+// or wider than the box it was given, which lipgloss pads but never trims,
+// so the two panes stopped being the same height and the borders wandered
+// off the screen:
+//
+//   - picker highlighted matched characters after truncating the row, so a
+//     filtered row overflowed its width and wrapped onto three lines;
+//   - picker's filter input was budgeted for its prompt but not for its
+//     cursor cell, leaving the query line one column wider than the rows;
+//   - calculateLayout floored each pane's content at a comfortable minimum
+//     rather than at what its share of the terminal could hold, so in the
+//     stacked layout two panes stacked into a frame taller than the screen.
+//
+// The assertion is deliberately structural rather than a golden render
+// (DESIGN.md section 13): whatever it draws, the browser occupies exactly
+// the height it was resized to and never more than its width.
+func TestModel_ViewFitsItsTerminalAtEverySize(t *testing.T) {
+	entries := make([]ui.ScanEntry, 0, 200)
+	for i := 0; i < 200; i++ {
+		entries = append(entries, ui.ScanEntry{
+			Path:    fmt.Sprintf("/var/log/service-%03d/application.log", i),
+			IsDir:   i%7 == 0,
+			ModTime: time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC),
+		})
+	}
+
+	// 20x6 is the smallest frame the split pane can hold: a bordered box is
+	// three rows at minimum, and below 72 columns two of them are stacked.
+	for _, width := range []int{20, 30, 71, 72, 100, 160} {
+		for _, height := range []int{6, 10, 24, 40} {
+			for _, query := range []string{"", "application", "0"} {
+				screen := browser.New(testHost, noopPreview).Resize(width, height)
+				m, ok := screen.(browser.Model)
+				if !ok {
+					t.Fatalf("Resize returned %T, want browser.Model", screen)
+				}
+				m, _ = update(t, m, ui.ScanEntriesMsg{Host: testHost, Entries: entries})
+				m, _ = update(t, m, ui.ScanDoneMsg{Host: testHost, Count: len(entries)})
+				for _, r := range query {
+					m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+				}
+
+				// Walk well past the first page: the break only showed
+				// once the cursor pushed the list's offset forward.
+				for step := 0; step < 40; step++ {
+					m = pressKeys(t, m, tea.KeyDown)
+					view := m.View()
+					if got := lipgloss.Height(view); got != height {
+						t.Fatalf("%dx%d query=%q step=%d: view is %d rows, want %d",
+							width, height, query, step, got, height)
+					}
+					if got := lipgloss.Width(view); got > width {
+						t.Fatalf("%dx%d query=%q step=%d: view is %d columns, want at most %d",
+							width, height, query, step, got, width)
+					}
+				}
+			}
+		}
+	}
+}

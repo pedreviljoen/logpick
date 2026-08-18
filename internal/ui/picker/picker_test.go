@@ -14,7 +14,10 @@ package picker_test
 // Offset, Selected), never on View's rendered output (DESIGN.md section 13).
 
 import (
+	"fmt"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/google/go-cmp/cmp"
@@ -406,5 +409,54 @@ func TestMatchIndexesComeFromFuzzyFindUnmodified(t *testing.T) {
 				t.Errorf("Matches() mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// TestView_RowNeverExceedsWidth is the regression test for the rendering
+// break this component caused in every screen that embeds it: match
+// highlighting was applied after the row was truncated, so a row carrying
+// k matched characters rendered up to 2k columns wider than the width it
+// had been truncated to. Inside a fixed-width pane, every one of those rows
+// wrapped onto three lines, and a list longer than its container pushed the
+// pane's own border off the screen.
+func TestView_RowNeverExceedsWidth(t *testing.T) {
+	names := make([]string, 0, 40)
+	for i := 0; i < 40; i++ {
+		names = append(names, fmt.Sprintf("/var/log/service-%02d/application.log", i))
+	}
+	items := newTestItems(names...)
+
+	for _, width := range []int{12, 20, 34, 60, 200} {
+		for _, query := range []string{"", "application", "varlogapplication", "0"} {
+			m := picker.New(items).SetWidth(width).SetHeight(10)
+			for _, r := range query {
+				m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			}
+			for i, line := range strings.Split(strings.TrimSuffix(m.View(), "\n"), "\n") {
+				if got := utf8.RuneCountInString(line); got > width {
+					t.Errorf("width=%d query=%q line %d is %d columns: %q", width, query, i, got, line)
+				}
+			}
+		}
+	}
+}
+
+// TestView_HighlightsByRuneNotByte covers the other half of the same loop:
+// fuzzy.Find reports rune indices, and the highlight used to index the row
+// by the byte offsets ranging over a string yields. The two agree only
+// while every character is ASCII, which a remote path is not required to
+// be.
+func TestView_HighlightsByRuneNotByte(t *testing.T) {
+	m := picker.New(newTestItems("/var/log/ünïcode/app.log")).SetWidth(60).SetHeight(5)
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+
+	// The row must still read as the path it came from once the bracket
+	// markers are removed, which is only true if the brackets landed on
+	// whole runes.
+	row := strings.Split(strings.TrimSuffix(m.View(), "\n"), "\n")[1]
+	row = strings.TrimPrefix(row, "> ") // the cursor marker every row carries
+	if got := strings.NewReplacer("[", "", "]", "").Replace(row); got != "/var/log/ünïcode/app.log" {
+		t.Errorf("row with markers stripped = %q, want the original path", got)
 	}
 }

@@ -166,3 +166,65 @@ func TestParseScan(t *testing.T) {
 		}
 	})
 }
+
+// TestParseScan_DirectoryMarks covers the two marks a browse listing
+// (BuildBrowse) uses to say "this is a directory, not a log": GNU's
+// trailing slash, which must not survive into Entry.Path, and the BSD mode
+// column's leading 'd'. A discovery scan's output carries neither, so the
+// same parser reading both marks unconditionally must still report every
+// -type f entry as a file.
+func TestParseScan_DirectoryMarks(t *testing.T) {
+	tests := []struct {
+		name    string
+		gnuFind bool
+		input   string
+		want    []Entry
+	}{
+		{
+			name:    "GNU trailing slash marks a directory and is stripped from Path",
+			gnuFind: true,
+			input: "224\t1755180171.5\t/opt/app/logs/\n" +
+				"286\t1755180172.5\t/opt/app/logs/app.log\n",
+			want: []Entry{
+				{Path: "/opt/app/logs", Size: 224, ModTime: time.Unix(1755180171, 500000000), IsDir: true},
+				{Path: "/opt/app/logs/app.log", Size: 286, ModTime: time.Unix(1755180172, 500000000)},
+			},
+		},
+		{
+			name:    "the filesystem root printed as // comes back as /",
+			gnuFind: true,
+			input:   "4096\t1755180171.0\t//\n",
+			want:    []Entry{{Path: "/", Size: 4096, ModTime: time.Unix(1755180171, 0), IsDir: true}},
+		},
+		{
+			name:    "BSD reads the directory bit from the mode column",
+			gnuFind: false,
+			input: "drwxr-xr-x  4 0  0  128 Aug 14 16:02 /opt/app/logs\n" +
+				"-rw-r--r--  1 0  0  286 Aug 14 16:02 /opt/app/logs/app.log\n",
+			want: []Entry{
+				{Path: "/opt/app/logs", Size: 128, IsDir: true},
+				{Path: "/opt/app/logs/app.log", Size: 286},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := make(chan Entry, len(tt.want))
+			report, err := ParseScan(strings.NewReader(tt.input), tt.gnuFind, out)
+			if err != nil {
+				t.Fatalf("ParseScan returned %v, want nil", err)
+			}
+			var got []Entry
+			for e := range out {
+				got = append(got, e)
+			}
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("entries mismatch (-want +got):\n%s", diff)
+			}
+			if report.Count != len(tt.want) || report.Skipped != 0 {
+				t.Errorf("report = %+v, want Count=%d Skipped=0", report, len(tt.want))
+			}
+		})
+	}
+}

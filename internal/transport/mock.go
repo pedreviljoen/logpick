@@ -74,7 +74,12 @@ var (
 //     - an optional "-maxdepth N": N is the number of levels below a root
 //     Mock will descend, the root itself being depth 0 — matching GNU
 //     find's own definition. Omitted, descent is unbounded.
-//     - "-type f": required; every match is a regular file.
+//     - an optional "-type f": present, every match is a regular file.
+//     Absent — the browse listing T09's BuildBrowse emits — directories
+//     are matched too, the roots included, and each is marked the way a
+//     real find marks it for T10: a trailing "/" on the GNU path, a
+//     leading 'd' in the BSD mode column. Name patterns are never
+//     applied to a directory.
 //     - an optional "\( -name 'PAT' [-o -name 'PAT' ...] \)": a file is a
 //     candidate only if its base name matches at least one PAT
 //     (path.Match semantics). Absent, every regular file found under a
@@ -82,8 +87,11 @@ var (
 //     - zero or more "! -name 'PAT'": a candidate matching any of these
 //     patterns is excluded.
 //     - the output clause, which selects the response format below:
-//     "-printf '%s\t%T@\t%p\n'" selects the GNU form; "-exec ls -ldn --
-//     {} +" selects the BSD form. Either may be followed by
+//     "-printf '%s\t%T@\t%p\n'" selects the GNU form; BuildBrowse's
+//     "\( -type d -printf FMT -o -printf FMT \)" selects it too, and
+//     "-exec ls -ldn -- {} +" selects the BSD form. Only the shape of
+//     either -printf clause is checked, never the format string's own
+//     content. Any of them may be followed by
 //     "2>/dev/null", which is recognised and ignored, since Mock is not
 //     a shell and there is no stderr redirection for it to perform.
 //
@@ -522,6 +530,19 @@ type scanSpec struct {
 	includes []string
 	excludes []string
 	format   string // "gnu" or "bsd"
+	dirs     bool   // true for a browse listing (BuildBrowse): no -type f, so directories are listed too.
+}
+
+// isExprToken reports whether tok begins a find expression rather than
+// naming a scan root. The root list ends at the first of these, which is
+// what lets parseScan accept both BuildScan's `-type f` scan and
+// BuildBrowse's listing, whose first expression token is `\(` or -exec.
+func isExprToken(tok string) bool {
+	switch tok {
+	case "-maxdepth", "-type", "-printf", "-exec", "!", `\(`, "2>/dev/null":
+		return true
+	}
+	return false
 }
 
 // parseScan attempts to parse tokens (already split by tokenize) as a find
@@ -535,7 +556,7 @@ func parseScan(tokens []string) (*scanSpec, bool) {
 	idx := 1
 
 	var roots []string
-	for idx < len(tokens) && tokens[idx] != "-maxdepth" && tokens[idx] != "-type" {
+	for idx < len(tokens) && !isExprToken(tokens[idx]) {
 		roots = append(roots, tokens[idx])
 		idx++
 	}
@@ -557,16 +578,20 @@ func parseScan(tokens []string) (*scanSpec, bool) {
 		idx++
 	}
 
-	if idx >= len(tokens) || tokens[idx] != "-type" {
-		return nil, false
+	// `-type f` is what separates a discovery scan (BuildScan) from a
+	// browse listing (BuildBrowse); the latter omits it so directories
+	// are listed alongside files.
+	if idx < len(tokens) && tokens[idx] == "-type" {
+		idx++
+		if idx >= len(tokens) || tokens[idx] != "f" {
+			return nil, false
+		}
+		idx++
+	} else {
+		spec.dirs = true
 	}
-	idx++
-	if idx >= len(tokens) || tokens[idx] != "f" {
-		return nil, false
-	}
-	idx++
 
-	if idx < len(tokens) && tokens[idx] == `\(` {
+	if idx+1 < len(tokens) && tokens[idx] == `\(` && tokens[idx+1] == "-name" {
 		idx++
 		for {
 			if idx >= len(tokens) || tokens[idx] != "-name" {
@@ -607,6 +632,38 @@ func parseScan(tokens []string) (*scanSpec, bool) {
 		return nil, false
 	}
 	switch tokens[idx] {
+	case `\(`:
+		// BuildBrowse's GNU output clause, one find expression that
+		// prints a directory with a trailing slash and everything else
+		// plain:
+		//
+		//	\( -type d -printf FMT -o -printf FMT \)
+		//
+		// Only its shape is checked; neither format string's content is
+		// part of the contract, exactly as for the plain -printf below.
+		spec.format = "gnu"
+		idx++
+		for _, want := range []string{"-type", "d", "-printf"} {
+			if idx >= len(tokens) || tokens[idx] != want {
+				return nil, false
+			}
+			idx++
+		}
+		idx++ // directory format string.
+		for _, want := range []string{"-o", "-printf"} {
+			if idx >= len(tokens) || tokens[idx] != want {
+				return nil, false
+			}
+			idx++
+		}
+		if idx >= len(tokens) {
+			return nil, false
+		}
+		idx++ // file format string.
+		if idx >= len(tokens) || tokens[idx] != `\)` {
+			return nil, false
+		}
+		idx++
 	case "-printf":
 		spec.format = "gnu"
 		idx++
@@ -642,6 +699,10 @@ func parseScan(tokens []string) (*scanSpec, bool) {
 type scanMatch struct {
 	remote string
 	info   os.FileInfo
+	// dir reports whether this match is a directory, so execScan can
+	// write the mark ParseScan (T10) reads: a trailing slash on the GNU
+	// path, a leading 'd' in the BSD mode column.
+	dir bool
 }
 
 // execScan runs a parsed find scan against the fixture tree and formats the
@@ -658,7 +719,7 @@ func (m *Mock) execScan(spec *scanSpec) (*Process, error) {
 			if err != nil {
 				return nil, err
 			}
-			matches, err := m.collectMatches(localRoot, spec.maxdepth)
+			matches, err := m.collectMatches(localRoot, spec.maxdepth, spec.dirs)
 			if err != nil {
 				return nil, fmt.Errorf("scanning %s: %w", remoteRoot, err)
 			}
@@ -668,6 +729,10 @@ func (m *Mock) execScan(spec *scanSpec) (*Process, error) {
 
 	filtered := candidates[:0]
 	for _, c := range candidates {
+		if c.dir {
+			filtered = append(filtered, c)
+			continue
+		}
 		base := path.Base(c.remote)
 		if len(spec.includes) > 0 && !matchesAny(spec.includes, base) {
 			continue
@@ -683,12 +748,18 @@ func (m *Mock) execScan(spec *scanSpec) (*Process, error) {
 	var buf bytes.Buffer
 	for _, c := range filtered {
 		mt := c.info.ModTime()
+		remote, mode := c.remote, "-rw-r--r--"
+		if c.dir {
+			// The two directory marks ParseScan reads; see BuildBrowse's
+			// "Output clause" for why each dialect carries its own.
+			remote, mode = c.remote+"/", "drwxr-xr-x"
+		}
 		switch spec.format {
 		case "gnu":
-			fmt.Fprintf(&buf, "%d\t%d.%09d\t%s\n", c.info.Size(), mt.Unix(), mt.Nanosecond(), c.remote)
+			fmt.Fprintf(&buf, "%d\t%d.%09d\t%s\n", c.info.Size(), mt.Unix(), mt.Nanosecond(), remote)
 		case "bsd":
-			fmt.Fprintf(&buf, "-rw-r--r-- 1 501 20 %d %s %d %02d:%02d %s\n",
-				c.info.Size(), mt.Format("Jan"), mt.Day(), mt.Hour(), mt.Minute(), c.remote)
+			fmt.Fprintf(&buf, "%s 1 501 20 %d %s %d %02d:%02d %s\n",
+				mode, c.info.Size(), mt.Format("Jan"), mt.Day(), mt.Hour(), mt.Minute(), c.remote)
 		}
 	}
 
@@ -742,10 +813,12 @@ func (m *Mock) expandRoot(tok string) ([]string, error) {
 
 // collectMatches walks localRoot (a file or a directory, already validated
 // by mapPath) collecting every regular file at depth <= maxdepth (root
-// itself is depth 0), or every regular file if maxdepth is nil. A missing
-// root yields no matches rather than an error, the same way "2>/dev/null"
-// silently drops a real find's complaint about it.
-func (m *Mock) collectMatches(localRoot string, maxdepth *int) ([]scanMatch, error) {
+// itself is depth 0), or every regular file if maxdepth is nil. With dirs
+// set - a browse listing, whose command carries no `-type f` - directories
+// are collected as well, the root included, exactly as a real find prints
+// them. A missing root yields no matches rather than an error, the same
+// way "2>/dev/null" silently drops a real find's complaint about it.
+func (m *Mock) collectMatches(localRoot string, maxdepth *int, dirs bool) ([]scanMatch, error) {
 	info, err := os.Lstat(localRoot) //nolint:gosec // localRoot is derived from a scan root already validated by mapPath's traversal guard.
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -755,13 +828,13 @@ func (m *Mock) collectMatches(localRoot string, maxdepth *int) ([]scanMatch, err
 	}
 
 	var out []scanMatch
-	if err := m.walk(localRoot, info, 0, maxdepth, &out); err != nil {
+	if err := m.walk(localRoot, info, 0, maxdepth, dirs, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (m *Mock) walk(p string, info os.FileInfo, depth int, maxdepth *int, out *[]scanMatch) error {
+func (m *Mock) walk(p string, info os.FileInfo, depth int, maxdepth *int, dirs bool, out *[]scanMatch) error {
 	if maxdepth != nil && depth > *maxdepth {
 		return nil
 	}
@@ -779,6 +852,14 @@ func (m *Mock) walk(p string, info os.FileInfo, depth int, maxdepth *int, out *[
 		return nil
 	}
 
+	if dirs {
+		rel, err := filepath.Rel(m.dir, p)
+		if err != nil {
+			return err
+		}
+		*out = append(*out, scanMatch{remote: "/" + filepath.ToSlash(rel), info: info, dir: true})
+	}
+
 	entries, err := os.ReadDir(p) //nolint:gosec // p is derived from a scan root already validated by mapPath's traversal guard.
 	if err != nil {
 		return err
@@ -788,7 +869,7 @@ func (m *Mock) walk(p string, info os.FileInfo, depth int, maxdepth *int, out *[
 		if err != nil {
 			return err
 		}
-		if err := m.walk(filepath.Join(p, e.Name()), childInfo, depth+1, maxdepth, out); err != nil {
+		if err := m.walk(filepath.Join(p, e.Name()), childInfo, depth+1, maxdepth, dirs, out); err != nil {
 			return err
 		}
 	}

@@ -33,14 +33,35 @@ const DefaultDebounce = 120 * time.Millisecond
 
 // entryItem adapts a ui.ScanEntry to picker.Item so the browser's file list
 // can be a picker.Model[entryItem]. FilterValue is the entry's full remote
-// path, which is what the picker's fuzzy match runs against.
+// path, which is what the picker's fuzzy match runs against and, since
+// picker renders the value it matched, also what the row displays.
 type entryItem struct {
 	// Entry is the wrapped scan result.
 	Entry ui.ScanEntry
 }
 
-// FilterValue returns the entry's remote path.
-func (i entryItem) FilterValue() string { return i.Entry.Path }
+// FilterValue returns the entry's list value. See listValue.
+func (i entryItem) FilterValue() string { return listValue(i.Entry) }
+
+// listValue is the string the file list matches and renders for an entry:
+// its remote path, with a trailing "/" when the entry is a directory.
+//
+// picker.Model has no separate display hook - it renders the same string it
+// filtered on - so the trailing slash is the only place a directory can be
+// marked as one. That makes the list value differ from ui.ScanEntry.Path
+// for directories, and everything inside Model that identifies an entry by
+// what the list has highlighted (indexOfPath, Highlighted,
+// currentListPath) goes through this function rather than reading Path
+// directly, so the two can never be compared against each other by
+// accident. Anything that leaves this package for the remote - a preview
+// request, a fetch, a directory to descend into - uses Entry.Path, which
+// never carries the slash.
+func listValue(e ui.ScanEntry) string {
+	if e.IsDir {
+		return e.Path + "/"
+	}
+	return e.Path
+}
 
 // PreviewFunc fetches the head of a remote file for the preview pane: the
 // tail -n 100 that backs a PreviewMsg. Model calls it only from inside the
@@ -372,6 +393,9 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		}
 		entries := append([]ui.ScanEntry(nil), msg.Entries...)
 		next := m.withEntries(entries)
+		// A cached listing is the configured scan for this host, which
+		// leaves browse mode if a one-off listing had been showing.
+		next.activeScanPath = ""
 		result, cmd := next.applyHighlightChange()
 		return result, cmd
 
@@ -503,7 +527,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
 			next := m
 			next.pathSearching = false
 			next.pathInput.Blur()
-			return next, func() tea.Msg { return ui.PathScanRequestedMsg{Host: m.host, Path: path} }
+			return next, pathScanCmd(m.host, path)
 		default:
 			next := m
 			var cmd tea.Cmd
@@ -563,7 +587,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
 		next.previewFocused = !m.previewFocused
 		return next, nil
 	}
-	if !m.previewFocused && msg.String() == " " {
+	if !m.previewFocused && (msg.String() == " " || msg.Type == tea.KeyEnter) {
+		// Both keys commit the highlighted row, and what committing means
+		// depends on what it is: a log is fetched to a local snapshot, a
+		// directory is descended into, since a directory has nothing to
+		// fetch or read (ui.ScanEntry.IsDir).
+		if entry, ok := m.Highlighted(); ok && entry.IsDir {
+			return m, pathScanCmd(m.host, entry.Path)
+		}
 		return m.startSelection()
 	}
 	if m.previewFocused {
@@ -591,6 +622,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
 	next.list, listCmd = next.list.Update(msg)
 	result, hiCmd := next.applyHighlightChange()
 	return result, tea.Batch(listCmd, hiCmd)
+}
+
+// pathScanCmd returns the command asking the composition layer for an
+// unfiltered listing of path on host: every file and directory under it,
+// with the profile's log patterns ignored (see ui.PathScanRequestedMsg).
+// Ctrl+S with a typed path and enter on a directory both go through it, so
+// descending is the same operation as typing the child path by hand.
+func pathScanCmd(host, path string) tea.Cmd {
+	return func() tea.Msg { return ui.PathScanRequestedMsg{Host: host, Path: path} }
 }
 
 func (m Model) startSelection() (ui.ScreenModel, tea.Cmd) {
@@ -730,11 +770,19 @@ func (m Model) withEntries(newEntries []ui.ScanEntry) Model {
 	return m
 }
 
-// indexOfPath returns the index of the entry with the given path in
-// entries, or -1 if none matches.
-func indexOfPath(entries []ui.ScanEntry, path string) int {
+// indexOfPath returns the index of the entry whose list value is value, or
+// -1 if none matches. It takes a list value, not a ui.ScanEntry.Path; see
+// listValue.
+//
+// The trailing slash is split off once, before the loop, rather than
+// rebuilt per entry with listValue: this runs over every entry on the
+// render path and a browse listing can hold ten thousand of them, so
+// comparing against a value the loop does not have to allocate matters.
+// strings.CutSuffix returns a slice of value, never a copy.
+func indexOfPath(entries []ui.ScanEntry, value string) int {
+	path, isDir := strings.CutSuffix(value, "/")
 	for i, e := range entries {
-		if e.Path == path {
+		if e.Path == path && e.IsDir == isDir {
 			return i
 		}
 	}
@@ -786,15 +834,21 @@ func (m Model) applyHighlightChange() (Model, tea.Cmd) {
 
 	next.previewLines = nil
 	next.previewViewport.GotoTop()
-	if ok {
-		next.previewViewport.SetContent("Loading preview…")
-	} else {
-		next.previewViewport.SetContent("Select a log to load its preview.")
-	}
-
 	if !ok {
+		next.previewViewport.SetContent("Select a log to load its preview.")
 		return next, nil
 	}
+
+	// A directory is somewhere to look, not something to read: the tail
+	// behind PreviewFunc fails on one on every host, so no request is ever
+	// issued for it and no generation is burned waiting for the reply
+	// (ui.ScanEntry.IsDir). Enter descends instead.
+	if entry, found := next.Highlighted(); found && entry.IsDir {
+		next.previewViewport.SetContent("Directory — press enter to list what is inside it.")
+		return next, nil
+	}
+
+	next.previewViewport.SetContent("Loading preview…")
 
 	gen := next.gen
 	host := next.host
@@ -810,6 +864,14 @@ func (m Model) applyHighlightChange() (Model, tea.Cmd) {
 // 4), or issuing the tea.Cmd that performs the preview request on a miss.
 func (m Model) handleDebounce(msg ui.PreviewDebounceMsg) (ui.ScreenModel, tea.Cmd) {
 	if msg.Gen != m.gen || msg.Host != m.host {
+		return m, nil
+	}
+
+	// "Never tail a directory" is enforced here as well as in
+	// applyHighlightChange, which does not issue a tick for one: this is
+	// the single point every preview request passes through, so the
+	// invariant holds even for a tick that arrived by some other route.
+	if idx := indexOfPath(m.entries, msg.Path); idx >= 0 && m.entries[idx].IsDir {
 		return m, nil
 	}
 
@@ -902,6 +964,37 @@ func cacheStore(cache []cacheEntry, entry cacheEntry) []cacheEntry {
 	return updated
 }
 
+// browseSummary is the count line View shows under the title once a
+// one-off listing has finished: what was found, split by kind so an empty
+// result reads as an answer rather than as a list that failed to load.
+func (m Model) browseSummary() string {
+	if len(m.entries) == 0 {
+		return "Nothing readable here — ctrl+s to try another path"
+	}
+	dirs := 0
+	for _, e := range m.entries {
+		if e.IsDir {
+			dirs++
+		}
+	}
+	files := len(m.entries) - dirs
+	return fmt.Sprintf("%d files, %d directories — type to filter", files, dirs)
+}
+
+// clipLines returns s with at most n lines, dropping any beyond that. A
+// trailing newline is not a line: "a\n" is one line, so clipping it to one
+// leaves it unchanged.
+func clipLines(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[:n], "\n")
+}
+
 type browserLayout struct {
 	stacked                 bool
 	leftWidth, rightWidth   int
@@ -930,10 +1023,17 @@ func calculateLayout(width, height int) browserLayout {
 		layout.rightWidth = width - layout.leftWidth - 1
 		layout.leftHeight, layout.rightHeight = height, height
 	}
-	layout.leftContentWidth = max(20, layout.leftWidth-4)
-	layout.rightContentWidth = max(20, layout.rightWidth-4)
-	layout.leftContentHeight = max(4, layout.leftHeight-2)
-	layout.rightContentHeight = max(4, layout.rightHeight-2)
+	// Content is the pane less its border and its one column of padding on
+	// each side. The floor is 1, not a comfortable minimum: a pane whose
+	// content is floored above what its share of the terminal can hold
+	// renders taller or wider than the space it was given, and in stacked
+	// mode two of those stack into a frame taller than the screen. A
+	// terminal too small to be useful should render small and intact
+	// rather than correctly proportioned and broken.
+	layout.leftContentWidth = max(1, layout.leftWidth-4)
+	layout.rightContentWidth = max(1, layout.rightWidth-4)
+	layout.leftContentHeight = max(1, layout.leftHeight-2)
+	layout.rightContentHeight = max(1, layout.rightHeight-2)
 	return layout
 }
 
@@ -946,18 +1046,29 @@ func (m Model) View() string {
 	leftTextWidth := max(1, layout.leftContentWidth-2)
 	rightTextWidth := max(1, layout.rightContentWidth-2)
 
-	left.WriteString(m.theme.Title.Render(fitLine("Logs — "+m.host, leftTextWidth)))
+	leftTitle := "Logs — " + m.host
+	if m.activeScanPath != "" {
+		leftTitle = "Browsing — " + m.activeScanPath
+	}
+	left.WriteString(m.theme.Title.Render(fitLine(leftTitle, leftTextWidth)))
 	left.WriteByte('\n')
-	if m.scanDone {
-		fmt.Fprintf(&left, "%d files\n\n", len(m.entries))
-	} else if m.activeScanPath != "" {
-		left.WriteString(fitLine("Scanning "+m.activeScanPath+"…", leftTextWidth))
+	switch {
+	case m.scanDone && m.activeScanPath != "":
+		left.WriteString(fitLine(m.browseSummary(), leftTextWidth))
 		left.WriteString("\n\n")
-	} else {
+	case m.scanDone:
+		fmt.Fprintf(&left, "%d files\n\n", len(m.entries))
+	case m.activeScanPath != "":
+		left.WriteString(fitLine("Listing "+m.activeScanPath+"…", leftTextWidth))
+		left.WriteString("\n\n")
+	default:
 		left.WriteString("Scanning…\n\n")
 	}
 	left.WriteString(m.list.View())
-	leftControl := "space select • ctrl+s scan path • tab preview • esc hosts"
+	leftControl := "space select • ctrl+s find path • tab preview • esc hosts"
+	if m.activeScanPath != "" {
+		leftControl = "enter open • space select • ctrl+s find path • esc hosts"
+	}
 	if m.pathSearching {
 		leftControl = m.pathInput.View()
 	}
@@ -965,9 +1076,12 @@ func (m Model) View() string {
 
 	var right strings.Builder
 	title := "Preview"
-	if m.selectedPath != "" {
+	switch entry, ok := m.Highlighted(); {
+	case m.selectedPath != "":
 		title = "Selected — " + m.selectedPath
-	} else if m.hasHighlight {
+	case ok && entry.IsDir:
+		title = "Directory — " + m.highlightedPath
+	case m.hasHighlight:
 		title += " — " + m.highlightedPath
 	}
 	titleStyle := m.theme.Title
@@ -998,8 +1112,18 @@ func (m Model) View() string {
 			Padding(0, 1).
 			Border(lipgloss.RoundedBorder())
 	}
-	leftPane := pane(layout.leftContentWidth, layout.leftContentHeight, !m.previewFocused).Render(left.String())
-	rightPane := pane(layout.rightContentWidth, layout.rightContentHeight, m.previewFocused).Render(right.String())
+	// Both panes are clipped to the height they were laid out for before
+	// they are rendered. lipgloss pads content shorter than Height but
+	// does not trim content longer than it, so one pane overrunning its
+	// budget - a terminal too short for a pane's own chrome, a component
+	// that renders one line more than it was configured for - makes
+	// JoinHorizontal below align two boxes of different heights, and the
+	// screen comes apart. Clipping keeps that a local defect in one pane
+	// instead of a broken frame.
+	leftPane := pane(layout.leftContentWidth, layout.leftContentHeight, !m.previewFocused).
+		Render(clipLines(left.String(), layout.leftContentHeight))
+	rightPane := pane(layout.rightContentWidth, layout.rightContentHeight, m.previewFocused).
+		Render(clipLines(right.String(), layout.rightContentHeight))
 	if layout.stacked {
 		return lipgloss.JoinVertical(lipgloss.Left, leftPane, rightPane)
 	}
@@ -1055,10 +1179,8 @@ func (m Model) Highlighted() (ui.ScanEntry, bool) {
 	if !m.hasHighlight {
 		return ui.ScanEntry{}, false
 	}
-	for _, e := range m.entries {
-		if e.Path == m.highlightedPath {
-			return e, true
-		}
+	if idx := indexOfPath(m.entries, m.highlightedPath); idx >= 0 {
+		return m.entries[idx], true
 	}
 	return ui.ScanEntry{}, false
 }

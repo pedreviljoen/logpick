@@ -118,7 +118,7 @@ func failIfCalledList(t *testing.T) hosts.ListFunc {
 // (mechanic 1).
 func failIfCalledProber(t *testing.T) hosts.ProbeFunc {
 	t.Helper()
-	return func(ctx context.Context, host string, exec []string) error {
+	return func(ctx context.Context, host string, profile config.Profile) error {
 		t.Fatalf("ProbeFunc was called for host %q; a host resolved from an existing rule must connect without probing", host)
 		return nil
 	}
@@ -181,8 +181,8 @@ func TestModel_FirstRunGuidance(t *testing.T) {
 func TestModel_FirstRunIdentityIsOptional(t *testing.T) {
 	const host = "agent-backed.example.com"
 	var gotExec []string
-	prober := func(_ context.Context, _ string, exec []string) error {
-		gotExec = append([]string(nil), exec...)
+	prober := func(_ context.Context, _ string, profile config.Profile) error {
+		gotExec = append([]string(nil), profile.Exec...)
 		return nil
 	}
 	m := hosts.New(nil, failIfCalledList(t), hosts.WithProber(prober))
@@ -254,11 +254,11 @@ func TestModel_FirstRunFormBuildsAuthenticatedExecTemplate(t *testing.T) {
 	}
 	const host = "ec2-user@example.com"
 	var gotExec []string
-	prober := func(_ context.Context, gotHost string, exec []string) error {
+	prober := func(_ context.Context, gotHost string, profile config.Profile) error {
 		if gotHost != host {
 			t.Fatalf("probe host = %q, want %q", gotHost, host)
 		}
-		gotExec = append([]string(nil), exec...)
+		gotExec = append([]string(nil), profile.Exec...)
 		return nil
 	}
 
@@ -297,6 +297,73 @@ func TestModel_FirstRunFormBuildsAuthenticatedExecTemplate(t *testing.T) {
 	}
 	if diff := cmp.Diff(want, cfg.Profiles[host].Exec); diff != "" {
 		t.Fatalf("persisted exec template mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestModel_FirstRunPersistentToggleBuildsWrapperProfile covers the fix for
+// a wrapper like ec2-ssh, whose CLI takes a host and no remote command. The
+// user tabs to the persistent checkbox, toggles it with space, and connects.
+// The probed and persisted profile must carry Persistent true and an exec
+// template that stops at {host} - never the ssh-style "-- {cmd}" tail, which
+// ec2-ssh would parse as a second host address and reject.
+func TestModel_FirstRunPersistentToggleBuildsWrapperProfile(t *testing.T) {
+	const host = "devStack"
+	var gotProfile config.Profile
+	prober := func(_ context.Context, gotHost string, profile config.Profile) error {
+		if gotHost != host {
+			t.Fatalf("probe host = %q, want %q", gotHost, host)
+		}
+		gotProfile = profile
+		return nil
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	m := hosts.New(nil, failIfCalledList(t),
+		hosts.WithProber(prober),
+		hosts.WithWriter(hosts.WriteConfigFile(configPath)),
+	)
+	m, _ = update(t, m, ui.HostsLoadedMsg{})
+	m = typeString(t, m, host)
+	// Host field -> Identity -> Command -> Persistent checkbox.
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	m = typeString(t, m, "ec2-ssh")
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	// A space press arrives as KeyRunes, not KeySpace (see handleKey and
+	// browser_test.go), so toggle the checkbox the same way real input does.
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+
+	m, probeCmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if probeCmd == nil {
+		t.Fatal("connection form returned nil probe command")
+	}
+	probeResult := probeCmd()
+
+	wantExec := []string{"ec2-ssh", "{host}"}
+	if diff := cmp.Diff(wantExec, gotProfile.Exec); diff != "" {
+		t.Fatalf("probe exec template mismatch (-want +got):\n%s", diff)
+	}
+	if !gotProfile.Persistent {
+		t.Fatal("probe profile.Persistent = false, want true after toggling the checkbox")
+	}
+
+	_, writeCmd := update(t, m, probeResult)
+	if writeCmd == nil {
+		t.Fatal("successful probe returned nil config write command")
+	}
+	if _, ok := writeCmd().(ui.HostSelectedMsg); !ok {
+		t.Fatal("config write did not continue to host selection")
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("loading generated config: %v", err)
+	}
+	if diff := cmp.Diff(wantExec, cfg.Profiles[host].Exec); diff != "" {
+		t.Fatalf("persisted exec template mismatch (-want +got):\n%s", diff)
+	}
+	if !cfg.Profiles[host].Persistent {
+		t.Fatal("persisted profile.Persistent = false, want true")
 	}
 }
 
@@ -434,7 +501,7 @@ func TestModel_FailedProbeWritesNothingAndSurfacesError(t *testing.T) {
 		const host = "widget-07.staging.internal"
 
 		probeErr := errors.New("dial tcp 10.0.0.9:22: connect: connection refused")
-		prober := func(ctx context.Context, gotHost string, exec []string) error {
+		prober := func(ctx context.Context, gotHost string, profile config.Profile) error {
 			if gotHost != host {
 				t.Fatalf("ProbeFunc called with host %q, want %q", gotHost, host)
 			}
@@ -505,12 +572,15 @@ func TestModel_SuccessfulProbeWritesNewProfile(t *testing.T) {
 		path, cfg, _ := copyFixture(t, "base.toml")
 		const host = "widget-07.staging.internal"
 
-		prober := func(ctx context.Context, gotHost string, exec []string) error {
+		prober := func(ctx context.Context, gotHost string, profile config.Profile) error {
 			if gotHost != host {
 				t.Fatalf("ProbeFunc called with host %q, want %q", gotHost, host)
 			}
-			if diff := cmp.Diff(config.DefaultProfile.Exec, exec); diff != "" {
+			if diff := cmp.Diff(config.DefaultProfile.Exec, profile.Exec); diff != "" {
 				t.Fatalf("ProbeFunc exec (-want +got):\n%s", diff)
+			}
+			if profile.Persistent {
+				t.Fatalf("ProbeFunc profile.Persistent = true, want false for a plain ssh first-run")
 			}
 			return nil
 		}
@@ -598,12 +668,55 @@ func TestApplyFirstRun_PreservesHandWrittenComment(t *testing.T) {
 	})
 }
 
+// TestApplyFirstRun_PersistentProfile locks the persistent branch of
+// ApplyFirstRun: a profile with Persistent true must emit `persistent =
+// true` and round-trip back through config.Load with the flag intact, since
+// that flag is what makes the wrapper's exec template runnable at all.
+func TestApplyFirstRun_PersistentProfile(t *testing.T) {
+	const host = "devStack"
+	profile := config.DefaultProfile
+	profile.Exec = []string{"ec2-ssh", "{host}"}
+	profile.Persistent = true
+
+	got, err := hosts.ApplyFirstRun(nil, host, host, profile)
+	if err != nil {
+		t.Fatalf("ApplyFirstRun: %v", err)
+	}
+	if !strings.Contains(string(got), "persistent = true") {
+		t.Fatalf("ApplyFirstRun did not emit persistent = true:\n%s", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if werr := os.WriteFile(path, got, 0o600); werr != nil {
+		t.Fatalf("writing generated config: %v", werr)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("loading generated config: %v", err)
+	}
+	if !cfg.Profiles[host].Persistent {
+		t.Fatalf("reloaded profile.Persistent = false, want true:\n%s", got)
+	}
+}
+
+// TestApplyFirstRun_NonPersistentOmitsFlag guards against writing the noisy
+// default: a non-persistent profile must not emit a persistent line at all.
+func TestApplyFirstRun_NonPersistentOmitsFlag(t *testing.T) {
+	got, err := hosts.ApplyFirstRun(nil, "host", "host", config.DefaultProfile)
+	if err != nil {
+		t.Fatalf("ApplyFirstRun: %v", err)
+	}
+	if strings.Contains(string(got), "persistent") {
+		t.Fatalf("ApplyFirstRun emitted a persistent line for a non-persistent profile:\n%s", got)
+	}
+}
+
 func TestModel_PromotingMatchRulePreservesHandWrittenComment(t *testing.T) {
 	t.Run("promoting a match rule leaves an existing hand-written comment in config.toml intact", func(t *testing.T) {
 		path, cfg, original := copyFixture(t, "with_comment.toml")
 		const host = "abc.example.com"
 
-		prober := func(ctx context.Context, gotHost string, exec []string) error { return nil }
+		prober := func(ctx context.Context, gotHost string, profile config.Profile) error { return nil }
 
 		m := hosts.New(cfg, failIfCalledList(t),
 			hosts.WithProber(prober),

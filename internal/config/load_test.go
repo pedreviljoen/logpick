@@ -198,3 +198,84 @@ exec = ["ssh", "{host}", "--", "{cmd}"]
 		}
 	})
 }
+
+// TestLoad_ExecRequiredPlaceholders covers checkExecPlaceholders: an exec
+// template that would silently drop the command it is handed (no {cmd}) or
+// the host it targets (no {host}) is a load error, while a persistent
+// profile is allowed to omit {cmd} because it feeds commands to an
+// interactive shell rather than passing them as an argv (DESIGN.md 7.3).
+func TestLoad_ExecRequiredPlaceholders(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantErr    bool
+		wantDetail string // substring the error must name when wantErr
+	}{
+		{
+			name:    "ssh template with host and cmd is valid",
+			body:    `exec = ["ssh", "{host}", "--", "{cmd}"]`,
+			wantErr: false,
+		},
+		{
+			name:       "non-persistent template missing cmd is rejected",
+			body:       `exec = ["ec2-ssh", "{host}"]`,
+			wantErr:    true,
+			wantDetail: "{cmd}",
+		},
+		{
+			name: "persistent template may omit cmd",
+			body: `exec = ["ec2-ssh", "{host}"]
+persistent = true`,
+			wantErr: false,
+		},
+		{
+			name: "persistent template still requires host",
+			body: `exec = ["ec2-ssh"]
+persistent = true`,
+			wantErr:    true,
+			wantDetail: "{host}",
+		},
+		{
+			name:       "template missing host is rejected",
+			body:       `exec = ["ssh", "--", "{cmd}"]`,
+			wantErr:    true,
+			wantDetail: "{host}",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			content := "[profile.default]\n" + tc.body + "\n"
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatalf("writing fixture: %v", err)
+			}
+
+			cfg, err := Load(path)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("Load returned an unexpected error: %v", err)
+				}
+				if cfg == nil {
+					t.Fatal("expected a usable Config, got nil")
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatal("expected a validation error, got nil")
+			}
+			if cfg != nil {
+				t.Errorf("expected a nil Config on validation failure, got %+v", cfg)
+			}
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("error does not wrap ErrInvalidConfig: %v", err)
+			}
+			if tc.wantDetail != "" && !strings.Contains(err.Error(), tc.wantDetail) {
+				t.Errorf("error does not name %q: %v", tc.wantDetail, err)
+			}
+		})
+	}
+}

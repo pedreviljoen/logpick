@@ -267,13 +267,14 @@ func hostLabel(cfg *config.Config, host string) string {
 // to the hostname the user actually typed and closes it afterward. Focused
 // tests that omit the factory fall back to d.Transport.
 func hostsProbeFunc(d appDeps) hosts.ProbeFunc {
-	return func(ctx context.Context, host string, exec []string) error {
+	return func(ctx context.Context, host string, profile config.Profile) error {
 		if d.NewTransport == nil {
 			return connectionProbeError(d.Transport.Check(ctx))
 		}
 
-		profile := config.DefaultProfile
-		profile.Exec = append([]string(nil), exec...)
+		// profile arrives fully formed from the form, including Persistent,
+		// so NewTransport picks the backend the profile actually calls for
+		// rather than probing every wrapper as if it were plain ssh.
 		tp := d.NewTransport(host, profile)
 		defer func() { _ = tp.Close() }()
 		return connectionProbeError(tp.Check(ctx))
@@ -757,7 +758,7 @@ func wireTUI(root *cobra.Command) {
 			if mockDir != "" {
 				return transport.NewMock(mockDir)
 			}
-			return transport.NewCommand(host, profile)
+			return transport.New(host, profile)
 		}
 
 		stateStore := state.New(statePath)

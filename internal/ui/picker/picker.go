@@ -338,3 +338,21 @@ func (m Model[T]) SetHeight(height int) Model[T] {
 	m.cursor, m.offset = clampView(m.cursor, len(m.matches), m.offset, height)
 	return m
 }
+
+// SetCursor returns the updated model with Cursor set to i, never mutating
+// the receiver. i indexes into the current match set (Matches()), not the
+// unfiltered item slice given to New — the two differ whenever a filter is
+// active.
+//
+// An out-of-range i, including on an empty match set, is clamped into the
+// valid range rather than panicking: the same clampView rule ctrl+n and
+// ctrl+p movement uses, so Offset ends up exactly where repeatedly pressing
+// ctrl+n (or ctrl+p) from the current position to reach index i would have
+// left it. This exists so a caller that grows or replaces the item set
+// mid-session (DESIGN.md 9.4's streaming scan case) can restore a
+// previously highlighted row in O(1) instead of replaying synthetic key
+// presses.
+func (m Model[T]) SetCursor(i int) Model[T] {
+	m.cursor, m.offset = clampView(i, len(m.matches), m.offset, m.height)
+	return m
+}

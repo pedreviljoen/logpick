@@ -259,6 +259,119 @@ func TestEnterCommitsSelection(t *testing.T) {
 	})
 }
 
+// SetCursor test plan (AGENTS.md section 5, copied verbatim from F01's
+// contract before any test below was written):
+//
+//  1. Setting the cursor to a valid index moves it there and the offset
+//     follows the same rule as ctrl+n movement to that index.
+//  2. An out-of-range index clamps to the bounds instead of panicking, on
+//     both a populated and an empty match set.
+//  3. Setting the cursor does not disturb the match set or a committed
+//     selection.
+
+// Mechanic 1: setting the cursor to a valid index moves it there and the
+// offset follows the same rule as ctrl+n movement to that index. Asserted
+// by comparing SetCursor's resulting Cursor/Offset against the
+// Cursor/Offset produced by driving Update with i presses of ctrl+n from a
+// freshly built model over the same items and height — that equivalence,
+// not any particular offset value, is the actual contract.
+func TestSetCursorMatchesCtrlNOffset(t *testing.T) {
+	items := newTestItems("i0", "i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8", "i9")
+	const height = 3
+
+	tests := []struct {
+		name  string
+		index int
+	}{
+		{"an index within the initial viewport", 0},
+		{"an index within the initial viewport, non-zero", 2},
+		{"an index just past the bottom edge", 3},
+		{"an index near the end of the match set", 9},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := picker.New(items).SetHeight(height)
+			for i := 0; i < tt.index; i++ {
+				want, _ = want.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+			}
+
+			got := picker.New(items).SetHeight(height).SetCursor(tt.index)
+
+			if got.Cursor() != want.Cursor() {
+				t.Errorf("Cursor() = %d, want %d", got.Cursor(), want.Cursor())
+			}
+			if got.Offset() != want.Offset() {
+				t.Errorf("Offset() = %d, want %d", got.Offset(), want.Offset())
+			}
+		})
+	}
+}
+
+// Mechanic 2: an out-of-range index clamps to the bounds instead of
+// panicking, on both a populated and an empty match set.
+func TestSetCursorClampsOutOfRangeIndex(t *testing.T) {
+	t.Run("a negative index clamps to 0 on a populated match set", func(t *testing.T) {
+		items := newTestItems("one", "two", "three")
+		m := picker.New(items).SetCursor(-1)
+
+		if got := m.Cursor(); got != 0 {
+			t.Errorf("Cursor() = %d, want 0", got)
+		}
+	})
+
+	t.Run("an index past the end clamps to the last match", func(t *testing.T) {
+		items := newTestItems("one", "two", "three")
+		m := picker.New(items).SetCursor(100)
+
+		if got := m.Cursor(); got != len(items)-1 {
+			t.Errorf("Cursor() = %d, want %d", got, len(items)-1)
+		}
+	})
+
+	t.Run("any index clamps to 0 on an empty match set without panicking", func(t *testing.T) {
+		items := newTestItems("one", "two", "three")
+		m := typeString(t, picker.New(items), "zzz")
+
+		m = m.SetCursor(5)
+
+		if got := m.Cursor(); got != 0 {
+			t.Errorf("Cursor() = %d, want 0", got)
+		}
+	})
+}
+
+// Mechanic 3: setting the cursor does not disturb the match set or a
+// committed selection.
+func TestSetCursorLeavesMatchesAndSelectionUntouched(t *testing.T) {
+	items := newTestItems("alpha", "beta", "gamma")
+
+	t.Run("the match set is unchanged", func(t *testing.T) {
+		m := picker.New(items)
+		before := m.Matches()
+
+		m = m.SetCursor(1)
+
+		if diff := cmp.Diff(before, m.Matches()); diff != "" {
+			t.Errorf("Matches() mismatch (-before +after):\n%s", diff)
+		}
+	})
+
+	t.Run("a committed selection is unchanged", func(t *testing.T) {
+		m := pressKeys(t, picker.New(items), tea.KeyEnter)
+
+		m = m.SetCursor(2)
+
+		got, ok := m.Selected()
+		if !ok {
+			t.Fatal("Selected() ok = false, want true")
+		}
+		if diff := cmp.Diff(items[0], got, cmp.AllowUnexported(testItem{})); diff != "" {
+			t.Errorf("Selected() mismatch (-want +got):\n%s", diff)
+		}
+	})
+}
+
 // Mechanic 5: match highlight indices come back from fuzzy.Find unmodified.
 func TestMatchIndexesComeFromFuzzyFindUnmodified(t *testing.T) {
 	items := newTestItems("apple", "apricot", "grape", "pineapple")

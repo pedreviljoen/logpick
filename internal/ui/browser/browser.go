@@ -324,9 +324,9 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 // list rebuilt over them. picker.Model offers no way to grow its item set
 // other than constructing a fresh one over the whole slice (New always
 // starts its cursor at 0), so when a highlighted path is still present in
-// newEntries, the fresh list's cursor is advanced back onto it by replaying
-// ctrl+n, which keeps a streaming scan from yanking the user's highlight
-// back to the top of the list every time a new batch arrives.
+// newEntries, the fresh list's cursor is restored onto it with a single
+// SetCursor call, which keeps a streaming scan from yanking the user's
+// highlight back to the top of the list every time a new batch arrives.
 func (m Model) withEntries(newEntries []ui.ScanEntry) Model {
 	m.entries = newEntries
 
@@ -337,10 +337,8 @@ func (m Model) withEntries(newEntries []ui.ScanEntry) Model {
 	newList := picker.New(items)
 
 	if m.hasHighlight {
-		if idx := indexOfPath(newEntries, m.highlightedPath); idx > 0 {
-			for i := 0; i < idx; i++ {
-				newList, _ = newList.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
-			}
+		if idx := indexOfPath(newEntries, m.highlightedPath); idx >= 0 {
+			newList = newList.SetCursor(idx)
 		}
 	}
 

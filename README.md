@@ -52,11 +52,17 @@ connection form:
   key contents.
 - **Command** — defaults to `ssh`. Arguments are supported. Custom wrappers may
   include `{host}` and `{cmd}` placeholders; if omitted, they are appended.
+- **Persistent session** — a checkbox (toggle with `Space`). Turn it on for a
+  wrapper that takes a host and *no* remote command, such as Amazon's
+  `ec2-ssh`. logpick then opens the wrapper once and runs commands through the
+  shell it drops you into, instead of appending a command the wrapper would
+  reject. Leave it off for `ssh` and any wrapper that forwards a trailing
+  command; those get the usual `{host} -- {cmd}` template.
 
-Use `Tab`/`Shift+Tab` to move between fields and `Enter` to connect. The
-identity file is optional: leave it blank to use your SSH agent or existing SSH
-configuration. The profile is written to `~/.config/logpick/config.toml` only
-after the connection probe succeeds.
+Use `Tab`/`Shift+Tab` to move between fields, `Space` to toggle the persistent
+checkbox and `Enter` to connect. The identity file is optional: leave it blank
+to use your SSH agent or existing SSH configuration. The profile is written to
+`~/.config/logpick/config.toml` only after the connection probe succeeds.
 
 After that, `logpick` opens on your saved hosts, and `logpick <host>` skips the
 list and connects straight away.

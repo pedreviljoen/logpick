@@ -412,7 +412,7 @@ func newScanCmd() *cobra.Command {
 			if mockDir != "" {
 				tp = transport.NewMock(mockDir)
 			} else {
-				tp = transport.NewCommand(host, resolved.Profile)
+				tp = transport.New(host, resolved.Profile)
 			}
 			defer func() { _ = tp.Close() }()
 

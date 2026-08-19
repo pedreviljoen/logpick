@@ -7,7 +7,36 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/pedreviljoen/logpick/internal/config"
 )
+
+// New builds the Transport backend a profile calls for, on host. It is the
+// single place that maps profile.Persistent onto a concrete backend, so
+// every call site - the TUI's newTransport factory and the scan command
+// alike - agrees on which backend a profile gets rather than each one
+// re-deciding (and, historically, always picking NewCommand and quietly
+// ignoring the flag).
+//
+// profile.Persistent true selects NewPersistent, for wrappers that cannot
+// take a remote command as an argv and instead expect an interactive shell
+// they can write commands into (DESIGN.md 7.3). Amazon's ec2-ssh is the
+// canonical example: its CLI is `ec2-ssh [options] <host>` with no slot for
+// a command, so an exec template like ["ec2-ssh", "{host}", "{cmd}"] makes
+// it parse the substituted find command as a second host address and fail
+// with HostInfoUndefinedHosttypeException. A persistent profile spawns
+// `ec2-ssh <host>` once and feeds commands to the shell it lands on.
+//
+// profile.Persistent false (the default) selects NewCommand, which spawns
+// one process per command with {cmd} substituted into the argv - correct
+// for ssh and any wrapper that forwards a trailing command, e.g.
+// ["ssh", "{host}", "--", "{cmd}"].
+func New(host string, profile config.Profile) Transport {
+	if profile.Persistent {
+		return NewPersistent(host, profile)
+	}
+	return NewCommand(host, profile)
+}
 
 // Transport runs a command on a remote host and streams its stdout back.
 //

@@ -33,8 +33,73 @@ func validatePlaceholders(cfg *Config) []error {
 		p := cfg.Profiles[name]
 		faults = append(faults, checkTemplate(name, "exec", p.Exec)...)
 		faults = append(faults, checkTemplate(name, "copy", p.Copy)...)
+		faults = append(faults, checkExecPlaceholders(name, p)...)
 	}
 	return faults
+}
+
+// checkExecPlaceholders enforces that a profile's exec template carries the
+// placeholders it cannot function without. It is separate from
+// checkTemplate, which only rejects *unknown* placeholders: this rejects a
+// syntactically valid template that is missing a *required* one.
+//
+// The rules follow how transport.Substitute (T03) fills a template: it only
+// replaces placeholders that literally appear, so a value with nowhere to go
+// is silently dropped rather than errored. That is exactly how a template
+// like ["ec2-ssh", "{host}"] produces a session that connects but runs no
+// command - the {cmd} the scanner passes has no slot and vanishes, so `find`
+// never runs and the file list comes back empty with no error anywhere.
+// Catching it here turns that silent dead end into a load-time error naming
+// the profile.
+//
+//   - {host} is required whenever exec is defined: a Profile describes a
+//     class of hosts (DESIGN.md 6.2), so the specific host the user picked
+//     can only reach the command line through {host}.
+//   - {cmd} is required unless the profile is persistent. A non-persistent
+//     profile runs one process per command and must have somewhere to put
+//     that command. A persistent profile (DESIGN.md 7.3) instead spawns an
+//     interactive shell once and writes commands to its stdin, so its exec
+//     template names only how to open that shell - ec2-ssh's `ec2-ssh
+//     <host>`, which takes no command argument at all - and legitimately
+//     omits {cmd}.
+//
+// A profile that omits exec entirely is not checked: it inherits the
+// built-in DefaultProfile exec at resolution (see mergeProfileFields in
+// resolve.go), which already carries both placeholders.
+func checkExecPlaceholders(profile string, p Profile) []error {
+	if len(p.Exec) == 0 {
+		return nil
+	}
+
+	var faults []error
+	if !execHasPlaceholder(p.Exec, "host") {
+		faults = append(faults, fmt.Errorf(
+			"profile %q: exec template must contain {host} so the target host reaches the command: %w",
+			profile, ErrInvalidConfig,
+		))
+	}
+	if !p.Persistent && !execHasPlaceholder(p.Exec, "cmd") {
+		faults = append(faults, fmt.Errorf(
+			"profile %q: exec template must contain {cmd} (or set persistent = true for a ssh wrapper): %w",
+			profile, ErrInvalidConfig,
+		))
+	}
+	return faults
+}
+
+// execHasPlaceholder reports whether any element of tmpl contains the
+// {name} placeholder, matching the same {word} syntax placeholderPattern
+// recognises so "{host}" is found but a bare "host" substring is not.
+func execHasPlaceholder(tmpl []string, name string) bool {
+	target := "{" + name + "}"
+	for _, elem := range tmpl {
+		for _, m := range placeholderPattern.FindAllStringSubmatch(elem, -1) {
+			if "{"+m[1]+"}" == target {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // checkTemplate reports a fault for every placeholder in tmpl that is not

@@ -51,10 +51,18 @@ type PinFunc func(host string, pinned bool) error
 // It is injected into New rather than Model holding a transport.Transport,
 // for the same reason browser.PreviewFunc is injected: this package stays
 // free of any dependency on internal/transport (DESIGN.md 9.2). Production
-// wiring builds exec's argv into a transport.Command and runs something
-// inexpensive like "true"; a test substitutes a func that never touches a
-// process.
-type ProbeFunc func(ctx context.Context, host string, exec []string) error
+// wiring hands profile to transport.New and runs something inexpensive like
+// "true"; a test substitutes a func that never touches a process.
+//
+// It takes the whole config.Profile rather than just the exec argv because
+// the argv alone does not determine how to run a command: a profile with
+// Persistent true must be probed through the persistent backend, which
+// spawns the wrapper once and writes commands to the shell it lands on,
+// while a non-persistent one substitutes {cmd} into the argv per call
+// (DESIGN.md 7.3). Probing a persistent wrapper as if it were a plain ssh
+// would append a command the wrapper cannot accept, which is exactly the
+// failure this signature exists to prevent.
+type ProbeFunc func(ctx context.Context, host string, profile config.Profile) error
 
 // WriteFunc persists a newly probed host's profile and routing rule to
 // config.toml. It is called only after ProbeFunc has already reported
@@ -253,6 +261,13 @@ type Model struct {
 	commandInput  textinput.Model
 	formFocus     int
 
+	// formPersistent is the "persistent session" toggle, the fourth form
+	// field. It records whether the command is a wrapper that takes a host
+	// and no remote command (ec2-ssh and similar), which must be driven as
+	// one long-lived shell rather than one process per command. See
+	// firstRunProfile for why this cannot be inferred from the command.
+	formPersistent bool
+
 	// Theme editor state. Changes preview live through ui.ThemeChangedMsg and
 	// are persisted only when Enter commits them.
 	theming                bool
@@ -299,7 +314,7 @@ func New(cfg *config.Config, list ListFunc, opts ...Option) Model {
 		pinFn: func(host string, pinned bool) error {
 			return fmt.Errorf("hosts: no PinFunc configured (use WithPinner); cannot set pinned=%v for host %q", pinned, host)
 		},
-		probeFn: func(ctx context.Context, host string, exec []string) error {
+		probeFn: func(ctx context.Context, host string, profile config.Profile) error {
 			return fmt.Errorf("hosts: no ProbeFunc configured (use WithProber); cannot probe host %q", host)
 		},
 		writeFn: func(host, profileName string, profile config.Profile) error {
@@ -525,13 +540,24 @@ func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
 			next.defining = false
 			return next, nil
 		case tea.KeyTab, tea.KeyDown:
-			next := m.focusFormField((m.formFocus + 1) % 3)
+			next := m.focusFormField((m.formFocus + 1) % formFieldCount)
 			return next, nil
 		case tea.KeyShiftTab, tea.KeyUp:
-			next := m.focusFormField((m.formFocus + 2) % 3)
+			next := m.focusFormField((m.formFocus + formFieldCount - 1) % formFieldCount)
 			return next, nil
 		case tea.KeyEnter:
 			return m.handleEnterDefining()
+		}
+		// The persistent toggle is a checkbox, not a text field: space
+		// flips it. A space press arrives as KeyRunes whose String() is " "
+		// (bubbletea does not use KeySpace for typed input), which is the
+		// same check browser.go uses; matching it here keeps the space from
+		// falling through into a text field. Every other key, and a space
+		// on any other field, goes to the focused input.
+		if m.formFocus == formFieldPersistent && msg.String() == " " {
+			next := m
+			next.formPersistent = !next.formPersistent
+			return next, nil
 		}
 		return m.updateFormInput(msg)
 	}
@@ -555,6 +581,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
 	next.list, cmd = next.list.Update(msg)
 	return next, cmd
 }
+
+// The connection form's fields, in tab order. formFieldPersistent is a
+// checkbox toggled with space rather than a textinput; the rest are text
+// fields. formFieldCount bounds the tab wrap-around.
+const (
+	formFieldHost = iota
+	formFieldIdentity
+	formFieldCommand
+	formFieldPersistent
+	formFieldCount
+)
 
 func newConnectionInputs() (textinput.Model, textinput.Model, textinput.Model) {
 	host := textinput.New()
@@ -580,7 +617,8 @@ func (m Model) openConnectionForm() Model {
 	m.input = host
 	m.identityInput = identity
 	m.commandInput = command
-	m.formFocus = 0
+	m.formFocus = formFieldHost
+	m.formPersistent = false
 	return m
 }
 
@@ -590,24 +628,26 @@ func (m Model) focusFormField(field int) Model {
 	m.commandInput.Blur()
 	m.formFocus = field
 	switch field {
-	case 0:
+	case formFieldHost:
 		m.input.Focus()
-	case 1:
+	case formFieldIdentity:
 		m.identityInput.Focus()
-	case 2:
+	case formFieldCommand:
 		m.commandInput.Focus()
 	}
+	// formFieldPersistent is a checkbox: nothing to focus, it renders its
+	// own marker and responds to space in handleKey.
 	return m
 }
 
 func (m Model) updateFormInput(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 	var cmd tea.Cmd
 	switch m.formFocus {
-	case 0:
+	case formFieldHost:
 		m.input, cmd = m.input.Update(msg)
-	case 1:
+	case formFieldIdentity:
 		m.identityInput, cmd = m.identityInput.Update(msg)
-	case 2:
+	case formFieldCommand:
 		m.commandInput, cmd = m.commandInput.Update(msg)
 	}
 	return m, cmd
@@ -810,7 +850,7 @@ func (m Model) handleEnterDefining() (ui.ScreenModel, tea.Cmd) {
 		}
 	}
 
-	profile, err := firstRunProfile(m.commandInput.Value(), m.identityInput.Value())
+	profile, err := firstRunProfile(m.commandInput.Value(), m.identityInput.Value(), m.formPersistent)
 	if err != nil {
 		return m, func() tea.Msg { return ui.ErrorMsg{Err: err} }
 	}
@@ -850,18 +890,47 @@ func (m Model) connectNewHost(host string, profile config.Profile) (ui.ScreenMod
 	next.pendingProfile = profile
 
 	probeFn := m.probeFn
-	exec := append([]string(nil), profile.Exec...)
+	probeProfile := profile
+	probeProfile.Exec = append([]string(nil), profile.Exec...)
 	cmd := func() tea.Msg {
 		return probeResultMsg{
 			host:    host,
 			profile: host,
-			err:     probeFn(context.Background(), host, exec),
+			err:     probeFn(context.Background(), host, probeProfile),
 		}
 	}
 	return next, cmd
 }
 
-func firstRunProfile(command, identity string) (config.Profile, error) {
+// firstRunProfile builds the profile the first-run form describes: the
+// command template to reach the host, an optional identity file, and
+// whether the command is a wrapper that must be driven as a persistent
+// session rather than handed a command per call.
+//
+// # Why persistent is a form field and not an inference
+//
+// A wrapper divides into one of two kinds, and nothing about its name or
+// argv reveals which:
+//
+//   - It forwards a trailing remote command, the way ssh does. Such a
+//     template needs a {cmd} placeholder for the command to land in, and
+//     runs one process per command.
+//   - It takes a host and nothing else, dropping the caller into an
+//     interactive shell. Amazon's ec2-ssh is this kind: its CLI is
+//     `ec2-ssh [options] <host>`, so an argument appended after the host is
+//     parsed as a second host address and rejected outright
+//     (HostInfoUndefinedHosttypeException). The only way to run commands
+//     through it is to spawn it once and write to the shell's stdin, which
+//     is what a persistent profile does (DESIGN.md 7.3).
+//
+// This function used to assume every command was the first kind and append
+// `-- {cmd}` unconditionally, which is precisely why the form could not
+// produce a working profile for anything but ssh. persistent now selects
+// between the two shapes, and only the non-persistent branch appends {cmd}.
+//
+// {host} is appended when absent in either case: without it the profile
+// cannot name the host it is connecting to.
+func firstRunProfile(command, identity string, persistent bool) (config.Profile, error) {
 	command = strings.TrimSpace(command)
 	if command == "" {
 		command = "ssh"
@@ -897,12 +966,13 @@ func firstRunProfile(command, identity string) (config.Profile, error) {
 	if !containsTemplate(argv, "{host}") {
 		argv = append(argv, "{host}")
 	}
-	if !containsTemplate(argv, "{cmd}") {
+	if !persistent && !containsTemplate(argv, "{cmd}") {
 		argv = append(argv, "--", "{cmd}")
 	}
 
 	profile := config.DefaultProfile
 	profile.Exec = argv
+	profile.Persistent = persistent
 	return profile, nil
 }
 
@@ -1092,18 +1162,24 @@ func (m Model) connectionFormView() string {
 	b.WriteByte('\n')
 	b.WriteString(m.theme.Dim.Render("For EC2, include the AMI user (often ubuntu@host or ec2-user@host)."))
 	b.WriteString("\n\n")
-	b.WriteString(renderFormField("Host (user@hostname)", m.input, m.formFocus == 0, m.theme))
-	b.WriteString(renderFormField("Identity file (-i) — optional; leave blank for SSH agent/config", m.identityInput, m.formFocus == 1, m.theme))
-	b.WriteString(renderFormField("Command", m.commandInput, m.formFocus == 2, m.theme))
+	b.WriteString(renderFormField("Host (user@hostname)", m.input, m.formFocus == formFieldHost, m.theme))
+	b.WriteString(renderFormField("Identity file (-i) — optional; leave blank for SSH agent/config", m.identityInput, m.formFocus == formFieldIdentity, m.theme))
+	b.WriteString(renderFormField("Command", m.commandInput, m.formFocus == formFieldCommand, m.theme))
+	b.WriteString(renderFormCheckbox(
+		"Persistent session — for wrappers that take no remote command (e.g. ec2-ssh)",
+		m.formPersistent, m.formFocus == formFieldPersistent, m.theme,
+	))
 	if m.hasPending {
 		b.WriteByte('\n')
 		b.WriteString(m.theme.Match.Render("● Connecting to " + m.pendingHost + "…"))
 		b.WriteByte('\n')
 	} else {
 		b.WriteByte('\n')
-		b.WriteString(m.theme.Dim.Render("Tab/Shift+Tab move  •  Enter connect  •  Esc cancel  •  Ctrl+C quit"))
+		b.WriteString(m.theme.Dim.Render("Tab/Shift+Tab move  •  Space toggle  •  Enter connect  •  Esc cancel"))
 		b.WriteByte('\n')
 		b.WriteString(m.theme.Dim.Render("Command defaults to ssh. Include {host} and {cmd} for custom templates."))
+		b.WriteByte('\n')
+		b.WriteString(m.theme.Dim.Render("Turn on Persistent for a wrapper like ec2-ssh that accepts only a hostname."))
 		b.WriteByte('\n')
 	}
 	return hostPanelStyle(m.width, m.theme).Render(b.String())
@@ -1128,6 +1204,24 @@ func renderFormField(label string, input textinput.Model, active bool, theme ui.
 		Border(lipgloss.NormalBorder()).
 		Render(input.View())
 	return fmt.Sprintf("%s%s\n%s\n\n", marker, labelStyle.Render(label), field)
+}
+
+// renderFormCheckbox renders a boolean form field in the same visual idiom
+// renderFormField uses for text fields - the same focus marker and label
+// styling - so the persistent toggle reads as one more field in the form
+// rather than a different kind of control bolted on.
+func renderFormCheckbox(label string, checked, active bool, theme ui.Theme) string {
+	marker := "  "
+	labelStyle := theme.Row
+	if active {
+		marker = "› "
+		labelStyle = theme.RowFocus
+	}
+	box := "[ ]"
+	if checked {
+		box = "[x]"
+	}
+	return fmt.Sprintf("%s%s %s\n\n", marker, box, labelStyle.Render(label))
 }
 
 func hostPanelStyle(width int, theme ui.Theme) lipgloss.Style {
@@ -1191,13 +1285,22 @@ func (m Model) Palette() (string, string) {
 }
 
 // ApplyFirstRun returns config.toml's bytes for existing with a new
-// [profile.<profileName>] block appended, carrying only profile's Exec and
-// Scan fields, never Copy, Persistent, ConnectTimeout, AuthHint or
-// SudoPrefix (invariant 3: a first-run profile is an exec template and a
-// scan spec, nothing else), and a new [[match]] block appended after it
-// routing host - matched literally as the pattern, not glob-expanded
-// beyond what a plain hostname already is under path.Match - to that
-// profile.
+// [profile.<profileName>] block appended, carrying profile's Exec, Scan and
+// Persistent fields, never Copy, ConnectTimeout, AuthHint or SudoPrefix,
+// and a new [[match]] block appended after it routing host - matched
+// literally as the pattern, not glob-expanded beyond what a plain hostname
+// already is under path.Match - to that profile.
+//
+// Persistent is written, as `persistent = true`, only when it is set;
+// false is the TOML default and writing it adds noise. It is included at
+// all - widening invariant 3's original "an exec template and a scan spec,
+// nothing else" - because it is not an optional embellishment the way the
+// other four fields are: it selects which transport backend runs the
+// profile (transport.New). Dropping it would write a profile that probed
+// successfully and is then unusable, since the exec template of a
+// persistent wrapper has no {cmd} for a per-call command to land in. The
+// four fields still excluded remain excluded: none of them changes whether
+// the profile can run a command at all.
 //
 // It is a textual edit, never a call to toml.Marshal. AGENTS.md section 9
 // names re-marshalling config.toml as the trap that destroys every
@@ -1235,6 +1338,9 @@ func ApplyFirstRun(existing []byte, host, profileName string, profile config.Pro
 
 	fmt.Fprintf(&b, "[profile.%s]\n", quotedProfile)
 	fmt.Fprintf(&b, "exec = %s\n", formatTOMLStringArray(profile.Exec))
+	if profile.Persistent {
+		fmt.Fprintf(&b, "persistent = true\n")
+	}
 	writeScanBlock(&b, quotedProfile, profile.Scan)
 
 	fmt.Fprintf(&b, "\n[[match]]\n")

@@ -4,6 +4,7 @@ package library
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -63,6 +64,11 @@ func WithContextFunc(fn ContextFunc) Option {
 	}
 }
 
+// WithTheme applies the configured interactive palette.
+func WithTheme(theme ui.Theme) Option {
+	return func(m *Model) { m.theme = theme }
+}
+
 // Model is the library screen: a fuzzy list over locally fetched files, with
 // delete (DESIGN.md 9.1). It implements ui.ScreenModel.
 //
@@ -98,6 +104,9 @@ func WithContextFunc(fn ContextFunc) Option {
 //
 // The zero value is not useful. Use New.
 type Model struct {
+	// theme styles the panel, title and controls.
+	theme ui.Theme
+
 	// deleter deletes one fetched file. See DeleteFunc.
 	deleter DeleteFunc
 
@@ -123,6 +132,7 @@ type Model struct {
 // request unless overridden by WithContextFunc.
 func New(deleter DeleteFunc, opts ...Option) Model {
 	m := Model{
+		theme:   ui.DefaultTheme(),
 		deleter: deleter,
 		ctxFunc: func() context.Context { return context.Background() },
 		list:    picker.New[fileItem](nil),
@@ -152,6 +162,14 @@ func buildList(files []ui.FetchedFile) picker.Model[fileItem] {
 	return picker.New(items)
 }
 
+func (m Model) sizedList(files []ui.FetchedFile) picker.Model[fileItem] {
+	list := buildList(files)
+	if m.height > 0 {
+		list = list.SetHeight(max(1, m.height-8)).SetWidth(max(1, m.width-8))
+	}
+	return list
+}
+
 // Update handles one message and returns the updated Model and, when the
 // message requires further work, the tea.Cmd that performs it. It never
 // mutates the receiver and it never blocks on I/O.
@@ -162,10 +180,10 @@ func buildList(files []ui.FetchedFile) picker.Model[fileItem] {
 //     rebuilds the picker over it.
 //   - ui.LibraryDeletedMsg drops the entry whose Local matches from Files
 //     and rebuilds the picker.
-//   - A tea.KeyMsg matching ctrl+d issues the delete command documented on
-//     Model's "Delete" section (mechanic 1) instead of being forwarded to
-//     the picker. Every other tea.KeyMsg is forwarded to the embedded
-//     picker.
+//   - A tea.KeyMsg matching enter reports the highlighted file as
+//     ui.FileSelectedMsg. esc reports ui.BackMsg. ctrl+d issues the delete
+//     command documented on Model's "Delete" section (mechanic 1). Every
+//     other tea.KeyMsg is forwarded to the embedded picker.
 //
 // Every other message is passed through unchanged and does not alter the
 // model.
@@ -175,7 +193,7 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		files := append([]ui.FetchedFile(nil), msg.Files...)
 		next := m
 		next.files = files
-		next.list = buildList(files)
+		next.list = next.sizedList(files)
 		return next, nil
 
 	case ui.LibraryDeletedMsg:
@@ -187,10 +205,25 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		}
 		next := m
 		next.files = files
-		next.list = buildList(files)
+		next.list = next.sizedList(files)
+		return next, nil
+
+	case ui.ThemeChangedMsg:
+		next := m
+		next.theme = ui.DefaultTheme().WithColors(msg.Primary, msg.Secondary)
 		return next, nil
 
 	case tea.KeyMsg:
+		if msg.Type == tea.KeyEsc {
+			return m, func() tea.Msg { return ui.BackMsg{} }
+		}
+		if msg.Type == tea.KeyEnter {
+			file, ok := m.Highlighted()
+			if !ok {
+				return m, nil
+			}
+			return m, func() tea.Msg { return ui.FileSelectedMsg{File: file} }
+		}
 		if msg.Type == tea.KeyCtrlD {
 			return m, m.deleteHighlightedCmd()
 		}
@@ -228,7 +261,36 @@ func (m Model) deleteHighlightedCmd() tea.Cmd {
 // View renders the query line followed by the match rows, sized to the area
 // Resize was last called with.
 func (m Model) View() string {
-	return m.list.View()
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	height := m.height
+	if height <= 0 {
+		height = 24
+	}
+	innerWidth := max(1, width-4)
+	innerHeight := max(1, height-2)
+	textWidth := max(1, innerWidth-2)
+
+	var b strings.Builder
+	b.WriteString(m.theme.Title.Render(fitLine("Library — fetched logs", textWidth)))
+	b.WriteByte('\n')
+	if len(m.files) == 0 {
+		b.WriteString(m.theme.Dim.Render(fitLine("No fetched logs yet. Space on a file in the browser saves one here.", textWidth)))
+	} else {
+		b.WriteString(m.theme.Dim.Render(fmt.Sprintf("%d files", len(m.files))))
+	}
+	b.WriteString("\n\n")
+	b.WriteString(m.list.View())
+	b.WriteString(m.theme.Dim.Render(fitLine("enter open  •  ctrl+d delete  •  type to filter  •  esc back", textWidth)))
+
+	body := clipLines(b.String(), innerHeight)
+	return m.theme.PaneActive.
+		Width(innerWidth).
+		Height(innerHeight).
+		Padding(0, 1).
+		Render(body)
 }
 
 // Resize records the area the screen has to render into and returns the
@@ -238,8 +300,34 @@ func (m Model) Resize(width, height int) ui.ScreenModel {
 	next := m
 	next.width = width
 	next.height = height
-	next.list = next.list.SetHeight(height)
+	listHeight := max(1, height-8)
+	next.list = next.list.SetHeight(listHeight).SetWidth(max(1, width-8))
 	return next
+}
+
+func fitLine(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width == 1 {
+		return "…"
+	}
+	return string(runes[:width-1]) + "…"
+}
+
+func clipLines(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[:n], "\n")
 }
 
 // Files returns every fetched file this Model currently lists, in the order

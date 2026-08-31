@@ -135,6 +135,11 @@ type App struct {
 	// ShowHelp reports whether the full help overlay is open.
 	ShowHelp bool
 
+	// LibraryFrom is the screen BackMsg from the library returns to. It is
+	// the screen that was active when the library was opened, so ctrl+l
+	// from hosts and from the browser both reverse correctly.
+	LibraryFrom Screen
+
 	// Keys is the global key map. Screens carry their own bindings.
 	Keys KeyMap
 
@@ -175,14 +180,17 @@ func (a App) Init() tea.Cmd { return a.Screens[a.Active].Init() }
 //
 // The root owns four things, and none of them are forwarded to a screen:
 //
-//   - tea.WindowSizeMsg records the new dimensions and resizes the active
-//     screen to the 75% content region. It emits no command.
-//   - ScreenTransitionMsg and BackMsg change the active screen. The screens that
-//     are not active are left exactly as they were. Neither emits a command.
+//   - tea.WindowSizeMsg records the new dimensions and resizes every screen
+//     to the 75% content region, so a screen opened later already has a size.
+//     It emits no command.
+//   - ScreenTransitionMsg and BackMsg change the active screen. Opening the
+//     library records LibraryFrom so esc returns to the screen that opened it.
+//     Neither emits a command.
 //   - ErrorMsg sets the error banner and ClearErrorMsg clears it. Neither
 //     changes the active screen and neither emits a command.
-//   - A tea.KeyMsg matching Keys.Quit or Keys.Help is handled here. Every other
-//     key goes to the active screen.
+//   - A tea.KeyMsg matching Keys.Quit or Keys.Help is handled here. While the
+//     help overlay is open, every other key is swallowed except esc, which
+//     closes it. Every other key goes to the active screen.
 //
 // Update never does I/O. Anything that touches the network or the disk is
 // returned as a tea.Cmd.
@@ -191,15 +199,25 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		a.Width = msg.Width
 		a.Height = msg.Height
-		a.Screens[a.Active] = a.Screens[a.Active].Resize(msg.Width, ContentHeight(msg.Height))
+		h := ContentHeight(msg.Height)
+		for i, screen := range a.Screens {
+			if screen != nil {
+				a.Screens[i] = screen.Resize(msg.Width, h)
+			}
+		}
 		return a, nil
 
 	case ScreenTransitionMsg:
+		if msg.To == ScreenLibrary && a.Active != ScreenViewer && a.Active != ScreenLibrary {
+			a.LibraryFrom = a.Active
+		}
 		a.Active = msg.To
+		a.resizeActive()
 		return a, nil
 
 	case BackMsg:
-		a.Active = backTarget(a.Active)
+		a.Active = backTarget(a.Active, a.LibraryFrom)
+		a.resizeActive()
 		return a, nil
 
 	case ErrorMsg:
@@ -229,11 +247,22 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.Err = nil
 			return a, nil
 		}
+		if a.ShowHelp {
+			switch {
+			case key.Matches(msg, a.Keys.Quit):
+				return a, tea.Quit
+			case key.Matches(msg, a.Keys.Help), msg.Type == tea.KeyEsc:
+				a.ShowHelp = false
+				return a, nil
+			default:
+				return a, nil
+			}
+		}
 		switch {
 		case key.Matches(msg, a.Keys.Quit):
 			return a, tea.Quit
 		case key.Matches(msg, a.Keys.Help):
-			a.ShowHelp = !a.ShowHelp
+			a.ShowHelp = true
 			return a, nil
 		}
 	}
@@ -244,17 +273,30 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // backTarget returns the screen the back edge out of active leads to. Screens
-// with no back edge in the screen graph (hosts, library) return themselves,
-// which is a no-op transition.
-func backTarget(active Screen) Screen {
+// with no back edge in the screen graph (hosts) return themselves, which is a
+// no-op transition. The library returns to libraryFrom, the screen that opened
+// it.
+func backTarget(active, libraryFrom Screen) Screen {
 	switch active {
 	case ScreenBrowser:
 		return ScreenHosts
 	case ScreenViewer:
 		return ScreenLibrary
+	case ScreenLibrary:
+		if libraryFrom == ScreenLibrary || libraryFrom == ScreenViewer {
+			return ScreenHosts
+		}
+		return libraryFrom
 	default:
 		return active
 	}
+}
+
+func (a *App) resizeActive() {
+	if a.Width <= 0 || a.Height <= 0 {
+		return
+	}
+	a.Screens[a.Active] = a.Screens[a.Active].Resize(a.Width, ContentHeight(a.Height))
 }
 
 // View renders the chrome around the active screen: the title line, the fixed
@@ -266,8 +308,15 @@ func (a App) View() string {
 	}
 	layout := calculateVerticalLayout(height)
 	title := a.Theme.Title.Render("logpick  /  " + a.Active.String())
+	if a.ShowHelp {
+		title = a.Theme.Title.Render("logpick  /  keys")
+	}
 	top := lipgloss.NewStyle().Height(layout.top).AlignVertical(lipgloss.Bottom).Render(title)
-	screen := lipgloss.NewStyle().Height(layout.content).Render(a.Screens[a.Active].View())
+	screenBody := a.Screens[a.Active].View()
+	if a.ShowHelp {
+		screenBody = a.helpView(max(1, a.Width), layout.content)
+	}
+	screen := lipgloss.NewStyle().Height(layout.content).Render(screenBody)
 
 	footer := lipgloss.NewStyle().Height(layout.error).Render(a.Theme.Status.Render(a.Status))
 	if a.Err != nil {
@@ -293,6 +342,58 @@ func (a App) View() string {
 	bottom := lipgloss.NewStyle().Height(layout.bottom).Render("")
 
 	return lipgloss.JoinVertical(lipgloss.Left, top, screen, footer, bottom)
+}
+
+func (a App) helpView(width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	innerWidth := max(8, width-6)
+	innerHeight := max(1, height-2)
+
+	var b strings.Builder
+	b.WriteString(a.Theme.Title.Render("keys"))
+	b.WriteString("\n\n")
+	for _, col := range a.Keys.FullHelp() {
+		for _, binding := range col {
+			h := binding.Help()
+			if h.Key == "" && h.Desc == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "%-10s  %s\n", h.Key, h.Desc)
+		}
+	}
+	b.WriteByte('\n')
+	b.WriteString(a.Theme.Dim.Render("f1 or esc close"))
+	b.WriteByte('\n')
+
+	body := clipHelp(b.String(), innerWidth, innerHeight)
+	return a.Theme.PaneActive.
+		Width(innerWidth).
+		Height(innerHeight).
+		Padding(0, 1).
+		Render(body)
+}
+
+func clipHelp(s string, width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for i, line := range lines {
+		runes := []rune(line)
+		if len(runes) > width {
+			if width == 1 {
+				lines[i] = "…"
+			} else {
+				lines[i] = string(runes[:width-1]) + "…"
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func wrapError(message string, width, maxLines int) string {

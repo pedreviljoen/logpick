@@ -304,3 +304,53 @@ func TestAppErrorBanner(t *testing.T) {
 		})
 	}
 }
+
+func TestAppHelpOverlaySwallowsKeys(t *testing.T) {
+	app, stubs := newTestApp(t, ScreenHosts)
+	app.Keys = DefaultKeyMap()
+
+	got, cmd := update(t, app, tea.KeyMsg{Type: tea.KeyF1})
+	if !got.ShowHelp {
+		t.Fatal("F1 did not open the help overlay")
+	}
+	if cmd != nil {
+		t.Fatal("opening help emitted a command")
+	}
+
+	got, cmd = update(t, got, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	if !got.ShowHelp {
+		t.Fatal("a key while help is open closed the overlay")
+	}
+	if cmd != nil {
+		t.Fatal("a swallowed help key emitted a command")
+	}
+	if n := len(stubs[ScreenHosts].msgs); n != 0 {
+		t.Fatalf("hosts received %d messages while help was open, want none", n)
+	}
+
+	got, _ = update(t, got, tea.KeyMsg{Type: tea.KeyEsc})
+	if got.ShowHelp {
+		t.Fatal("esc did not close the help overlay")
+	}
+}
+
+func TestAppBackFromLibraryReturnsToLibraryFrom(t *testing.T) {
+	app, _ := newTestApp(t, ScreenBrowser)
+	app.LibraryFrom = ScreenBrowser
+
+	got, cmd := update(t, app, ScreenTransitionMsg{To: ScreenLibrary})
+	if got.Active != ScreenLibrary {
+		t.Fatalf("active = %s, want library", got.Active)
+	}
+	if got.LibraryFrom != ScreenBrowser {
+		t.Fatalf("LibraryFrom = %s, want browser", got.LibraryFrom)
+	}
+	if cmd != nil {
+		t.Fatal("transition emitted a command")
+	}
+
+	got, _ = update(t, got, BackMsg{})
+	if got.Active != ScreenBrowser {
+		t.Fatalf("back from library active = %s, want browser", got.Active)
+	}
+}

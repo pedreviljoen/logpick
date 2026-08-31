@@ -1113,7 +1113,7 @@ func (m Model) View() string {
 	if len(m.hosts) == 0 {
 		body += m.theme.Dim.Render("No saved hosts. Press ctrl+n to configure a connection.") + "\n"
 	} else {
-		body += m.theme.Dim.Render("enter connect  •  ctrl+n new  •  ctrl+t theme  •  ctrl+p pin  •  ctrl+d delete") + "\n"
+		body += m.theme.Dim.Render("enter connect  •  ctrl+n new  •  ctrl+l library  •  ctrl+t theme  •  f1 keys") + "\n"
 	}
 	return hostPanelStyle(m.width, m.theme).Render(body)
 }

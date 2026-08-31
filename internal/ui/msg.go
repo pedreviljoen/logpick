@@ -314,6 +314,19 @@ type PreviewMsg struct {
 
 // --- Streaming --------------------------------------------------------------
 
+// FollowRequestedMsg asks the composition layer to start (or stop) a live
+// tail of Path on Host. A second request for the same path is a toggle: the
+// running follow is cancelled.
+//
+// Sent by the browser: F on a file, and esc while a follow is already
+// running. Handled by the composition layer, which replies with
+// FollowStartedMsg and then the usual LinesMsg/StreamClosedMsg stream, or
+// StreamClosedMsg alone when the request was a stop.
+type FollowRequestedMsg struct {
+	Host string
+	Path string
+}
+
 // FollowStartedMsg reports that a follow stream is open.
 //
 // Sent by the follow command. Handled by the browser, which switches the
@@ -396,6 +409,15 @@ type FetchDoneMsg struct {
 }
 
 // --- Library and viewer -----------------------------------------------------
+
+// FileSelectedMsg reports that the user committed a fetched file in the
+// library.
+//
+// Sent by the library screen on enter. Handled by the composition layer,
+// which opens the viewer on File.Local.
+type FileSelectedMsg struct {
+	File FetchedFile
+}
 
 // LibraryLoadedMsg carries the fetched files read from the state file.
 //

@@ -37,6 +37,7 @@ type KeyMap struct {
 	Fetch    key.Binding
 	Follow   key.Binding
 	ScanPath key.Binding
+	Library  key.Binding
 
 	// Viewer screen.
 	Search    key.Binding
@@ -125,8 +126,8 @@ func DefaultKeyMap() KeyMap {
 		),
 
 		Fetch: key.NewBinding(
-			key.WithKeys("f"),
-			key.WithHelp("f", "fetch"),
+			key.WithKeys(" "),
+			key.WithHelp("space", "fetch"),
 		),
 		Follow: key.NewBinding(
 			key.WithKeys("F"),
@@ -135,6 +136,10 @@ func DefaultKeyMap() KeyMap {
 		ScanPath: key.NewBinding(
 			key.WithKeys("ctrl+s"),
 			key.WithHelp("ctrl+s", "scan path"),
+		),
+		Library: key.NewBinding(
+			key.WithKeys("ctrl+l"),
+			key.WithHelp("ctrl+l", "library"),
 		),
 
 		Search: key.NewBinding(
@@ -169,7 +174,7 @@ func (k KeyMap) FullHelp() [][]key.Binding {
 		{k.Up, k.Down, k.PageUp, k.PageDown, k.Top, k.Bottom},
 		{k.Enter, k.Back, k.Filter, k.Next, k.Prev},
 		{k.Delete, k.Pin, k.NewHost, k.Theme},
-		{k.Fetch, k.Follow, k.ScanPath},
+		{k.Fetch, k.Follow, k.ScanPath, k.Library},
 		{k.Search, k.NextMatch, k.PrevMatch, k.ToggleRe},
 		{k.Help, k.Quit},
 	}

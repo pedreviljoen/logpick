@@ -79,10 +79,13 @@ Everything is one keystroke from the file list. Typing anything else filters.
 | type | browser | fuzzy-filter the file list |
 | `↑` `↓` (or `ctrl+p` `ctrl+n`) | browser | move the highlight |
 | `enter` or `space` | browser | fetch the log locally, or open a directory |
+| `F` | browser | live-tail the highlighted file (`tail -f`); again or `esc` to stop |
 | `ctrl+s` | browser | list a remote path discovery missed |
 | `tab` | browser | move focus between the file list and the pane |
 | `/` `n` `N` | pane | search the fetched log, next match, previous match |
-| `esc` | anywhere | back one screen, or dismiss an error |
+| `ctrl+l` | hosts, browser | open the local fetch library |
+| `enter` | library | open the highlighted fetch in the viewer |
+| `esc` | anywhere | back one screen, stop a follow, or dismiss an error |
 | `F1` | anywhere | key map overlay |
 | `ctrl+c` | anywhere | quit |
 
@@ -159,8 +162,7 @@ or deletes anything on a host.
 ## Status
 
 Under construction. Working today: the host list and first-run flow, discovery
-and the browser, remote previews, local fetch and search, one-off path
-listings, and the theme editor. The library and viewer screens are built but
-not yet reachable from a key, and follow mode is wired end to end but not yet
-bound to one.
+and the browser, remote previews, local fetch and search, live follow (`F`),
+one-off path listings, the fetch library (`ctrl+l`) and viewer, and the theme
+editor.
 

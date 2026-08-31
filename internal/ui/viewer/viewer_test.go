@@ -163,6 +163,18 @@ func matchesAt(n int) []ui.SearchMatch {
 	return matches
 }
 
+func TestModel_EscapeGoesBackToLibrary(t *testing.T) {
+	path := writeFile(t, "line\n")
+	m := viewer.New(path, noopSearch)
+	_, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("escape returned nil Cmd, want ui.BackMsg")
+	}
+	if _, ok := cmd().(ui.BackMsg); !ok {
+		t.Fatalf("escape command returned %T, want ui.BackMsg", cmd())
+	}
+}
+
 func pressRune(t *testing.T, m viewer.Model, r rune) viewer.Model {
 	t.Helper()
 	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})

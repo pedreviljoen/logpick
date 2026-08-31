@@ -240,6 +240,63 @@ func TestModel_EscapeReturnsToHosts(t *testing.T) {
 	}
 }
 
+func TestModel_FollowKeyRequestsLiveTail(t *testing.T) {
+	m := browser.New(testHost, noopPreview)
+	entries := entriesFor("/var/log/syslog", "/var/log/auth.log")
+	m, _ = update(t, m, ui.ScanEntriesMsg{Host: testHost, Entries: entries})
+
+	m, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'F'}})
+	if cmd == nil {
+		t.Fatal("F returned nil Cmd, want ui.FollowRequestedMsg")
+	}
+	raw := cmd()
+	got, ok := raw.(ui.FollowRequestedMsg)
+	if !ok {
+		t.Fatalf("F command returned %T, want ui.FollowRequestedMsg", raw)
+	}
+	want := ui.FollowRequestedMsg{Host: testHost, Path: "/var/log/syslog"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatalf("follow request mismatch (-want +got):\n%s", diff)
+	}
+
+	m, _ = update(t, m, ui.FollowStartedMsg{Host: testHost, Path: got.Path})
+	if !m.Following() {
+		t.Fatal("Following() = false after FollowStartedMsg")
+	}
+	if m.FollowPath() != got.Path {
+		t.Fatalf("FollowPath() = %q, want %q", m.FollowPath(), got.Path)
+	}
+
+	m, _ = update(t, m, ui.LinesMsg{Lines: []string{"line one", "line two"}})
+	if m.FollowLineCount() != 2 {
+		t.Fatalf("FollowLineCount() = %d, want 2", m.FollowLineCount())
+	}
+
+	m, escCmd := update(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if escCmd == nil {
+		t.Fatal("esc while following returned nil Cmd, want FollowRequestedMsg to stop")
+	}
+	if _, ok := escCmd().(ui.FollowRequestedMsg); !ok {
+		t.Fatalf("esc while following returned %T, want ui.FollowRequestedMsg", escCmd())
+	}
+
+	m, _ = update(t, m, ui.StreamClosedMsg{})
+	if m.Following() {
+		t.Fatal("Following() = true after StreamClosedMsg")
+	}
+}
+
+func TestModel_FollowIgnoredOnDirectory(t *testing.T) {
+	m := browser.New(testHost, noopPreview)
+	m, _ = update(t, m, ui.ScanEntriesMsg{Host: testHost, Entries: []ui.ScanEntry{
+		{Path: "/opt/app", IsDir: true},
+	}})
+	_, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'F'}})
+	if cmd != nil {
+		t.Fatalf("F on a directory returned %T, want nil", cmd())
+	}
+}
+
 func TestModel_EntriesPopulateProgressively(t *testing.T) {
 	t.Run("entries arriving on the scan channel populate the list progressively", func(t *testing.T) {
 		m := browser.New(testHost, noopPreview)

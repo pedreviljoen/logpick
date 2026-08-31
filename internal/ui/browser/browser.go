@@ -306,6 +306,13 @@ type Model struct {
 	matchIdx            int
 	filteredLineNumbers []int
 
+	// following reports whether the preview pane is a live tail. followPath
+	// is the remote file being tailed; followLines is the ring of streamed
+	// lines, capped at followCap (DESIGN.md 9.5).
+	following   bool
+	followPath  string
+	followLines []string
+
 	// requestCount is what PreviewRequestCount reports: how many times
 	// Update has issued a preview request (a cache miss on a settled,
 	// current-generation debounce tick).
@@ -435,6 +442,14 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		}
 		return next, nil
 
+	case ui.ScanStartedMsg:
+		if msg.Host != m.host {
+			return m, nil
+		}
+		next := m
+		next.scanDone = false
+		return next, nil
+
 	case ui.ScanDoneMsg:
 		if msg.Host != m.host {
 			return m, nil
@@ -442,6 +457,15 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		next := m
 		next.scanDone = true
 		return next, nil
+
+	case ui.FollowStartedMsg:
+		return m.handleFollowStarted(msg)
+
+	case ui.LinesMsg:
+		return m.handleFollowLines(msg)
+
+	case ui.StreamClosedMsg:
+		return m.handleFollowClosed()
 	case logSelectedMsg:
 		if msg.host != m.host {
 			return m, nil
@@ -573,7 +597,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
 	}
 
 	if msg.Type == tea.KeyEsc {
+		if m.following {
+			path := m.followPath
+			return m, func() tea.Msg {
+				return ui.FollowRequestedMsg{Host: m.host, Path: path}
+			}
+		}
 		return m, func() tea.Msg { return ui.BackMsg{} }
+	}
+	if !m.pathSearching && !m.searching && msg.String() == "F" {
+		return m.requestFollow()
 	}
 	if msg.Type == tea.KeyCtrlS {
 		next := m
@@ -631,6 +664,101 @@ func (m Model) handleKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
 // descending is the same operation as typing the child path by hand.
 func pathScanCmd(host, path string) tea.Cmd {
 	return func() tea.Msg { return ui.PathScanRequestedMsg{Host: host, Path: path} }
+}
+
+// followCap is how many live-tail lines the preview keeps (DESIGN.md 9.5).
+const followCap = 5000
+
+func (m Model) requestFollow() (ui.ScreenModel, tea.Cmd) {
+	if m.following {
+		path := m.followPath
+		if entry, ok := m.Highlighted(); ok && !entry.IsDir {
+			path = entry.Path
+		}
+		if path == "" {
+			return m, nil
+		}
+		return m, func() tea.Msg {
+			return ui.FollowRequestedMsg{Host: m.host, Path: path}
+		}
+	}
+	entry, ok := m.Highlighted()
+	if !ok || entry.IsDir {
+		return m, nil
+	}
+	return m, func() tea.Msg {
+		return ui.FollowRequestedMsg{Host: m.host, Path: entry.Path}
+	}
+}
+
+func (m Model) handleFollowStarted(msg ui.FollowStartedMsg) (ui.ScreenModel, tea.Cmd) {
+	if msg.Host != m.host {
+		return m, nil
+	}
+	next := m
+	if next.followPath != msg.Path {
+		next.followLines = nil
+	}
+	next.following = true
+	next.followPath = msg.Path
+	next.previewFocused = true
+	if next.cancel != nil {
+		next.cancel()
+		next.cancel = nil
+	}
+	if len(next.followLines) == 0 {
+		next.previewViewport.SetContent("Following " + msg.Path + "…")
+	}
+	next.previewViewport.GotoBottom()
+	return next, nil
+}
+
+func (m Model) handleFollowLines(msg ui.LinesMsg) (ui.ScreenModel, tea.Cmd) {
+	if len(msg.Lines) == 0 {
+		return m, nil
+	}
+	next := m
+	next.following = true
+	next.followLines = appendFollow(next.followLines, msg.Lines, followCap)
+	next.previewLines = next.followLines
+	next.previewViewport.SetContent(strings.Join(next.followLines, "\n"))
+	next.previewViewport.GotoBottom()
+	next.previewFocused = true
+	return next, nil
+}
+
+func (m Model) handleFollowClosed() (ui.ScreenModel, tea.Cmd) {
+	if !m.following {
+		return m, nil
+	}
+	next := m
+	next.following = false
+	if len(next.followLines) == 0 {
+		next.previewViewport.SetContent("Follow ended.")
+	}
+	return next, nil
+}
+
+func appendFollow(held, batch []string, cap int) []string {
+	if cap <= 0 {
+		return nil
+	}
+	total := len(held) + len(batch)
+	if total <= cap {
+		out := make([]string, total)
+		copy(out, held)
+		copy(out[len(held):], batch)
+		return out
+	}
+	out := make([]string, cap)
+	skip := total - cap
+	if skip >= len(held) {
+		copy(out, batch[skip-len(held):])
+		return out
+	}
+	copy(out, held[skip:])
+	copy(out[len(held)-skip:], batch)
+	return out
 }
 
 func (m Model) startSelection() (ui.ScreenModel, tea.Cmd) {
@@ -827,8 +955,9 @@ func (m Model) applyHighlightChange() (Model, tea.Cmd) {
 
 	// Space commits a local snapshot. Once committed, moving around the left
 	// list must not replace the searchable right-pane content with hover
-	// previews; another Space explicitly replaces the selection.
-	if next.selectedLocal != "" {
+	// previews; another Space explicitly replaces the selection. A live
+	// follow owns the pane the same way until it is stopped.
+	if next.selectedLocal != "" || next.following {
 		return next, nil
 	}
 
@@ -1065,9 +1194,9 @@ func (m Model) View() string {
 		left.WriteString("Scanning…\n\n")
 	}
 	left.WriteString(m.list.View())
-	leftControl := "space select • ctrl+s find path • tab preview • esc hosts"
+	leftControl := "space select • F follow • ctrl+s path • ctrl+l library • tab preview • esc hosts"
 	if m.activeScanPath != "" {
-		leftControl = "enter open • space select • ctrl+s find path • esc hosts"
+		leftControl = "enter open • space select • F follow • ctrl+s path • esc hosts"
 	}
 	if m.pathSearching {
 		leftControl = m.pathInput.View()
@@ -1077,6 +1206,8 @@ func (m Model) View() string {
 	var right strings.Builder
 	title := "Preview"
 	switch entry, ok := m.Highlighted(); {
+	case m.following:
+		title = "Follow — " + m.followPath
 	case m.selectedPath != "":
 		title = "Selected — " + m.selectedPath
 	case ok && entry.IsDir:
@@ -1085,15 +1216,17 @@ func (m Model) View() string {
 		title += " — " + m.highlightedPath
 	}
 	titleStyle := m.theme.Title
-	if m.selectedPath != "" {
+	if m.following || m.selectedPath != "" {
 		titleStyle = m.theme.Match
 	}
 	right.WriteString(titleStyle.Render(fitLine(title, rightTextWidth)))
 	right.WriteString("\n\n")
 	right.WriteString(m.previewViewport.View())
 	right.WriteByte('\n')
-	control := "tab files • ↑/↓/pgup/pgdn scroll • esc hosts"
-	if m.selectedLocal != "" {
+	control := "tab files • ↑/↓/pgup/pgdn scroll • F follow • esc hosts"
+	if m.following {
+		control = "live follow • F or esc stop • tab files"
+	} else if m.selectedLocal != "" {
 		control = fmt.Sprintf("/ search • n/N match • %d/%d • tab files", m.matchIdx+1, len(m.matches))
 	}
 	if m.searching {
@@ -1253,4 +1386,19 @@ func (m Model) FilteredLineCount() int {
 // ActiveScanPath returns the one-off path currently being discovered.
 func (m Model) ActiveScanPath() string {
 	return m.activeScanPath
+}
+
+// Following reports whether the preview pane is a live tail.
+func (m Model) Following() bool {
+	return m.following
+}
+
+// FollowPath returns the remote file currently being tailed, or empty.
+func (m Model) FollowPath() string {
+	return m.followPath
+}
+
+// FollowLineCount returns how many live-tail lines the preview currently holds.
+func (m Model) FollowLineCount() int {
+	return len(m.followLines)
 }

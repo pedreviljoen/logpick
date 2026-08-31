@@ -130,3 +130,33 @@ func TestModel_ListsAndDeletes(t *testing.T) {
 		}
 	})
 }
+
+func TestModel_EnterOpensHighlightedFile(t *testing.T) {
+	files := filesFor("/data/fetched/a/1/app.log", "/data/fetched/b/1/app.log")
+	m := library.New(func(context.Context, string) error { return nil })
+	m, _ = update(t, m, ui.LibraryLoadedMsg{Files: files})
+
+	_, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("enter returned nil Cmd, want ui.FileSelectedMsg")
+	}
+	raw := cmd()
+	got, ok := raw.(ui.FileSelectedMsg)
+	if !ok {
+		t.Fatalf("enter command returned %T, want ui.FileSelectedMsg", raw)
+	}
+	if diff := cmp.Diff(files[0], got.File); diff != "" {
+		t.Fatalf("FileSelectedMsg.File mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestModel_EscapeGoesBack(t *testing.T) {
+	m := library.New(func(context.Context, string) error { return nil })
+	_, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("escape returned nil Cmd, want ui.BackMsg")
+	}
+	if _, ok := cmd().(ui.BackMsg); !ok {
+		t.Fatalf("escape command returned %T, want ui.BackMsg", cmd())
+	}
+}

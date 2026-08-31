@@ -50,6 +50,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 
@@ -207,9 +208,9 @@ func newApp(d appDeps) (ui.App, error) {
 		browser.WithTheme(theme),
 	)
 
-	libraryScreen := library.New(libraryDeleteFunc(d))
+	libraryScreen := library.New(libraryDeleteFunc(d), library.WithTheme(theme))
 
-	viewerScreen := viewer.New("", viewerSearchFunc(d))
+	viewerScreen := viewer.New("", viewerSearchFunc(d), viewer.WithTheme(theme))
 
 	app := ui.New([4]ui.ScreenModel{
 		ui.ScreenHosts:   hostsScreen,
@@ -679,16 +680,24 @@ func toUIScanEntry(e remote.Entry) ui.ScanEntry {
 // start is surfaced to the user, the same as any other error this layer
 // returns directly instead of wrapping in a message.
 func (d appDeps) followCmd(ctx context.Context, errc chan<- error, host, path string) (tea.Cmd, error) {
-	_, run, err := remote.Follow(ctx, d.Transport, path, time.After)
+	cmd, _, err := d.startFollow(ctx, errc, host, path)
+	return cmd, err
+}
+
+// startFollow is followCmd plus the line channel the composition layer
+// drains with waitFollow. followCmd keeps its original two-value signature
+// so existing tests still compile against it.
+func (d appDeps) startFollow(ctx context.Context, errc chan<- error, host, path string) (tea.Cmd, <-chan []string, error) {
+	ch, run, err := remote.Follow(ctx, d.Transport, path, time.After)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	ui.SafeGo(ctx, errc, run)
 
 	return func() tea.Msg {
 		return ui.FollowStartedMsg{Host: host, Path: path}
-	}, nil
+	}, ch, nil
 }
 
 // wireTUI attaches the root TUI command's flags and RunE to root, so
@@ -979,6 +988,16 @@ type tuiModel struct {
 	scanReport  chan remote.Report
 	scanCancel  context.CancelFunc
 
+	// followCancel, followLines, followHost, followPath and followGen belong
+	// to the live tail currently backing the browser preview. followGen is
+	// incremented on every start or stop so a drain from a cancelled follow
+	// cannot close a newer one. followCancel is nil when no follow is running.
+	followCancel context.CancelFunc
+	followLines  <-chan []string
+	followHost   string
+	followPath   string
+	followGen    uint64
+
 	// initialHost and initialProfile, when initialHost is non-empty, make
 	// Init synthesize a ui.HostSelectedMsg for them, so a `logpick <host>`
 	// invocation jumps straight into browsing that host instead of
@@ -1064,18 +1083,73 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case scanReadyMsg:
 		return m.startScan(msg)
 
+	case ui.ScanStartedMsg:
+		next, cmd := m.routeToApp(msg)
+		next.app.Status = "scanning " + msg.Host + "…"
+		return next, cmd
+
+	case ui.ScanDoneMsg:
+		next, cmd := m.routeToApp(msg)
+		text := fmt.Sprintf("%d files", msg.Count)
+		if msg.Skipped > 0 {
+			text += fmt.Sprintf(", %d skipped", msg.Skipped)
+		}
+		if msg.Truncated {
+			text += ", truncated"
+		}
+		next.app.Status = text
+		return next, cmd
+
 	case ui.ScanEntriesMsg:
 		next, cmd := m.routeToApp(msg)
 		return next, tea.Batch(cmd, scanDrainCmd(msg.Host, m.scanEntries, m.scanReport))
+
+	case ui.FollowRequestedMsg:
+		return m.handleFollowRequest(msg)
+
+	case ui.FollowStartedMsg:
+		next, cmd := m.routeToApp(msg)
+		next.app.Status = "following " + msg.Path + " — F or esc to stop"
+		return next, cmd
+
+	case followBatchMsg:
+		return m.handleFollowBatch(msg)
+
+	case ui.FileSelectedMsg:
+		return m.openFile(msg)
+
+	case ui.LibraryLoadedMsg:
+		next, cmd := m.routeToApp(msg)
+		if next.app.Active == ui.ScreenLibrary {
+			n := len(msg.Files)
+			if n == 1 {
+				next.app.Status = "1 fetched log"
+			} else {
+				next.app.Status = fmt.Sprintf("%d fetched logs", n)
+			}
+		}
+		return next, cmd
 
 	case ui.PreviewMsg:
 		next, cmd := m.routeToApp(msg)
 		next.app.Err = nil
 		return next, cmd
 
+	case ui.BackMsg:
+		if m.app.Active == ui.ScreenBrowser {
+			m = m.stopFollow()
+		}
+		return m.routeToApp(msg)
+
 	case ui.ErrorMsg:
 		next, cmd := m.routeToApp(msg)
 		return next, tea.Batch(cmd, ui.WaitForError(m.errc))
+
+	case tea.KeyMsg:
+		if !m.app.ShowHelp && key.Matches(msg, m.app.Keys.Library) {
+			return m.openLibrary()
+		}
+		return m.routeToApp(msg)
 
 	default:
 		return m.routeToApp(msg)
@@ -1135,6 +1209,7 @@ func (m tuiModel) selectHost(msg ui.HostSelectedMsg) (tea.Model, tea.Cmd) {
 	if m.scanCancel != nil {
 		m.scanCancel()
 	}
+	m = m.stopFollow()
 
 	browserScreen := browser.New(
 		newDeps.Host.Name,
@@ -1152,6 +1227,7 @@ func (m tuiModel) selectHost(msg ui.HostSelectedMsg) (tea.Model, tea.Cmd) {
 	next.app.Screens[ui.ScreenBrowser] = browserScreen
 	next.app.Active = ui.ScreenBrowser
 	next.app.Err = nil
+	next.app.Status = "connecting to " + msg.Host + "…"
 
 	// Resize the newly installed browser screen so it has dimensions.
 	if next.app.Width > 0 && next.app.Height > 0 {
@@ -1286,6 +1362,124 @@ func cachedScanCmd(d appDeps, host string) tea.Cmd {
 
 		return ui.CachedScanMsg{Host: host}
 	}
+}
+
+// followBatchMsg is one drain of a live tail: either a batch of lines or
+// the channel close. gen is the follow generation the drain was issued
+// for, so a cancelled follow cannot close a newer one.
+type followBatchMsg struct {
+	gen    uint64
+	lines  []string
+	closed bool
+}
+
+func waitFollow(gen uint64, ch <-chan []string) tea.Cmd {
+	return func() tea.Msg {
+		lines, ok := <-ch
+		if !ok {
+			return followBatchMsg{gen: gen, closed: true}
+		}
+		return followBatchMsg{gen: gen, lines: lines}
+	}
+}
+
+func (m tuiModel) handleFollowRequest(msg ui.FollowRequestedMsg) (tea.Model, tea.Cmd) {
+	if strings.TrimSpace(msg.Path) == "" {
+		return m, nil
+	}
+
+	same := m.followCancel != nil && msg.Host == m.followHost && msg.Path == m.followPath
+	if m.followCancel != nil {
+		next := m.stopFollow()
+		if same {
+			routed, cmd := next.routeToApp(ui.StreamClosedMsg{})
+			routed.app.Status = "follow ended"
+			return routed, cmd
+		}
+		m = next
+	}
+
+	followCtx, cancel := context.WithCancel(m.ctx)
+	cmd, ch, err := m.active.startFollow(followCtx, m.errc, msg.Host, msg.Path)
+	if err != nil {
+		cancel()
+		return m, errCmd(err)
+	}
+
+	next := m
+	next.followGen++
+	next.followCancel = cancel
+	next.followLines = ch
+	next.followHost = msg.Host
+	next.followPath = msg.Path
+	return next, tea.Batch(cmd, waitFollow(next.followGen, ch))
+}
+
+func (m tuiModel) handleFollowBatch(msg followBatchMsg) (tea.Model, tea.Cmd) {
+	if msg.gen != m.followGen {
+		return m, nil
+	}
+	if msg.closed {
+		next, cmd := m.routeToApp(ui.StreamClosedMsg{})
+		next = next.stopFollow()
+		if strings.HasPrefix(next.app.Status, "following ") {
+			next.app.Status = "follow ended"
+		}
+		return next, cmd
+	}
+	next, cmd := m.routeToApp(ui.LinesMsg{Lines: msg.lines})
+	return next, tea.Batch(cmd, waitFollow(msg.gen, m.followLines))
+}
+
+func (m tuiModel) stopFollow() tuiModel {
+	if m.followCancel != nil {
+		m.followCancel()
+	}
+	m.followGen++
+	m.followCancel = nil
+	m.followLines = nil
+	m.followHost = ""
+	m.followPath = ""
+	return m
+}
+
+func (m tuiModel) openLibrary() (tea.Model, tea.Cmd) {
+	next := m
+	if next.app.Active == ui.ScreenBrowser {
+		next = next.stopFollow()
+	}
+	if next.app.Active != ui.ScreenViewer && next.app.Active != ui.ScreenLibrary {
+		next.app.LibraryFrom = next.app.Active
+	}
+	next.app.Active = ui.ScreenLibrary
+	next.app.Err = nil
+	next.app.ShowHelp = false
+	if next.app.Width > 0 && next.app.Height > 0 {
+		next.app.Screens[ui.ScreenLibrary] = next.app.Screens[ui.ScreenLibrary].Resize(
+			next.app.Width, ui.ContentHeight(next.app.Height),
+		)
+	}
+	return next, loadLibraryCmd(next.active)
+}
+
+func (m tuiModel) openFile(msg ui.FileSelectedMsg) (tea.Model, tea.Cmd) {
+	if msg.File.Local == "" {
+		return m, nil
+	}
+	theme := ui.DefaultTheme().WithColors(m.app.ThemePrimary, m.app.ThemeSecondary)
+	viewerScreen := viewer.New(msg.File.Local, viewerSearchFunc(m.active), viewer.WithTheme(theme))
+
+	next := m
+	next.app.Screens[ui.ScreenViewer] = viewerScreen
+	next.app.Active = ui.ScreenViewer
+	next.app.Err = nil
+	next.app.Status = "opened " + msg.File.Remote
+	if next.app.Width > 0 && next.app.Height > 0 {
+		next.app.Screens[ui.ScreenViewer] = next.app.Screens[ui.ScreenViewer].Resize(
+			next.app.Width, ui.ContentHeight(next.app.Height),
+		)
+	}
+	return next, viewerScreen.Init()
 }
 
 // View renders the wrapped App unchanged; tuiModel adds no chrome of its

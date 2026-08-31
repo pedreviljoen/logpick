@@ -52,6 +52,11 @@ func WithContextFunc(fn ContextFunc) Option {
 	}
 }
 
+// WithTheme applies the configured interactive palette.
+func WithTheme(theme ui.Theme) Option {
+	return func(m *Model) { m.theme = theme }
+}
+
 // Model is the viewer screen: a local file in a bubbles/viewport, with
 // in-file search (DESIGN.md 9.1). It implements ui.ScreenModel.
 //
@@ -107,6 +112,9 @@ func WithContextFunc(fn ContextFunc) Option {
 //
 // The zero value is not useful. Use New.
 type Model struct {
+	// theme styles the panel, title and controls.
+	theme ui.Theme
+
 	// path is the local file this Model was constructed to view. It never
 	// changes after New.
 	path string
@@ -159,6 +167,7 @@ type Model struct {
 // WithContextFunc.
 func New(path string, search SearchFunc, opts ...Option) Model {
 	m := Model{
+		theme:    ui.DefaultTheme(),
 		path:     path,
 		search:   search,
 		ctxFunc:  func() context.Context { return context.Background() },
@@ -247,6 +256,11 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		}
 		return next, nil
 
+	case ui.ThemeChangedMsg:
+		next := m
+		next.theme = ui.DefaultTheme().WithColors(msg.Primary, msg.Secondary)
+		return next, nil
+
 	case tea.KeyMsg:
 		return m.updateKey(msg)
 
@@ -291,6 +305,10 @@ func (m Model) updateKey(msg tea.KeyMsg) (ui.ScreenModel, tea.Cmd) {
 			next.query, cmd = next.query.Update(msg)
 			return next, cmd
 		}
+	}
+
+	if msg.Type == tea.KeyEsc {
+		return m, func() tea.Msg { return ui.BackMsg{} }
 	}
 
 	if r, ok := keyRune(msg); ok {
@@ -365,33 +383,89 @@ func (m Model) submitSearch() (ui.ScreenModel, tea.Cmd) {
 // the match count status line otherwise, sized to the area Resize was last
 // called with.
 func (m Model) View() string {
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	height := m.height
+	if height <= 0 {
+		height = 24
+	}
+	innerWidth := max(1, width-4)
+	innerHeight := max(1, height-2)
+	textWidth := max(1, innerWidth-2)
+
+	title := "Viewer"
+	if m.path != "" {
+		title += " — " + m.path
+	}
+
 	var b strings.Builder
+	b.WriteString(m.theme.Title.Render(fitLine(title, textWidth)))
+	b.WriteString("\n\n")
 	b.WriteString(m.viewport.View())
 	b.WriteByte('\n')
 	if m.searching {
 		b.WriteString(m.query.View())
 	} else {
-		fmt.Fprintf(&b, "%d/%d matches", m.matchIdx+1, len(m.matches))
+		status := fmt.Sprintf("%d/%d matches  •  / search  •  n/N step  •  esc library", m.matchIdx+1, len(m.matches))
+		if !m.loaded {
+			status = "Loading…"
+		}
+		b.WriteString(m.theme.Dim.Render(fitLine(status, textWidth)))
 	}
-	return b.String()
+
+	body := clipLines(b.String(), innerHeight)
+	return m.theme.PaneActive.
+		Width(innerWidth).
+		Height(innerHeight).
+		Padding(0, 1).
+		Render(body)
 }
 
 // Resize records the area the screen has to render into and returns the
-// updated Model, propagating the size to the embedded viewport less one row
-// for the status/query line.
+// updated Model, propagating the size to the embedded viewport less chrome
+// for the title and status/query line.
 func (m Model) Resize(width, height int) ui.ScreenModel {
 	next := m
 	next.width = width
 	next.height = height
 
-	vh := height - 1
+	innerWidth := max(1, width-6)
+	vh := height - 6
 	if vh < 0 {
 		vh = 0
 	}
-	next.viewport.Width = width
+	next.viewport.Width = innerWidth
 	next.viewport.Height = vh
+	next.query.Width = max(1, innerWidth-4)
 
 	return next
+}
+
+func fitLine(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width == 1 {
+		return "…"
+	}
+	return string(runes[:width-1]) + "…"
+}
+
+func clipLines(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[:n], "\n")
 }
 
 // Path returns the local file path this Model was constructed with.

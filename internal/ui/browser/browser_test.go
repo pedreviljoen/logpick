@@ -286,6 +286,49 @@ func TestModel_FollowKeyRequestsLiveTail(t *testing.T) {
 	}
 }
 
+func TestModel_FollowKeepsListFocusAndIgnoresStalePreview(t *testing.T) {
+	const path = "/var/log/syslog"
+	m := browser.New(testHost, noopPreview)
+	m, _ = update(t, m, ui.ScanEntriesMsg{Host: testHost, Entries: entriesFor(path)})
+	before := m.Gen()
+
+	m, _ = update(t, m, ui.FollowStartedMsg{Host: testHost, Path: path})
+	if m.Gen() == before {
+		t.Fatal("follow did not invalidate the in-flight preview generation")
+	}
+	m, cmd := update(t, m, ui.PreviewDebounceMsg{Gen: m.Gen(), Host: testHost, Path: path})
+	if cmd != nil {
+		t.Fatal("a debounce tick during follow issued a preview")
+	}
+
+	m, _ = update(t, m, ui.LinesMsg{Lines: []string{"live"}})
+	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if m.PreviewFocused() {
+		t.Fatal("tab did not leave the preview")
+	}
+	m, _ = update(t, m, ui.LinesMsg{Lines: []string{"still live"}})
+	if m.PreviewFocused() {
+		t.Fatal("a follow batch stole focus from the file list")
+	}
+	if m.FollowLineCount() != 2 {
+		t.Fatalf("FollowLineCount() = %d, want 2", m.FollowLineCount())
+	}
+
+	m, _ = update(t, m, ui.PreviewMsg{Gen: before, Host: testHost, Path: path, Lines: []string{"stale preview"}})
+	lines := m.PreviewLines()
+	if len(lines) != 2 || lines[0] != "live" || lines[1] != "still live" {
+		t.Fatalf("stale preview replaced the tail: %q", lines)
+	}
+}
+
+func TestModel_LinesIgnoredWhenNotFollowing(t *testing.T) {
+	m := browser.New(testHost, noopPreview)
+	m, _ = update(t, m, ui.LinesMsg{Lines: []string{"orphan"}})
+	if m.Following() || m.FollowLineCount() != 0 {
+		t.Fatalf("stray lines started a follow: following=%v lines=%d", m.Following(), m.FollowLineCount())
+	}
+}
+
 func TestModel_FollowIgnoredOnDirectory(t *testing.T) {
 	m := browser.New(testHost, noopPreview)
 	m, _ = update(t, m, ui.ScanEntriesMsg{Host: testHost, Entries: []ui.ScanEntry{

@@ -685,15 +685,23 @@ func (d appDeps) followCmd(ctx context.Context, errc chan<- error, host, path st
 }
 
 // startFollow is followCmd plus the line channel the composition layer
-// drains with waitFollow. followCmd keeps its original two-value signature
-// so existing tests still compile against it.
+// drains with waitFollow.
 func (d appDeps) startFollow(ctx context.Context, errc chan<- error, host, path string) (tea.Cmd, <-chan []string, error) {
 	ch, run, err := remote.Follow(ctx, d.Transport, path, time.After)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	ui.SafeGo(ctx, errc, run)
+	ui.SafeGo(ctx, errc, func(runCtx context.Context) error {
+		runErr := run(runCtx)
+		// A stop cancels ctx. The tail then fails with context.Canceled or
+		// with a pipe error from closing stdout under the reader. Neither
+		// is a failure the user asked to see.
+		if runErr == nil || ctx.Err() != nil {
+			return nil
+		}
+		return runErr
+	})
 
 	return func() tea.Msg {
 		return ui.FollowStartedMsg{Host: host, Path: path}
@@ -1085,19 +1093,23 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case ui.ScanStartedMsg:
 		next, cmd := m.routeToApp(msg)
-		next.app.Status = "scanning " + msg.Host + "…"
+		if next.followCancel == nil {
+			next.app.Status = "scanning " + msg.Host + "…"
+		}
 		return next, cmd
 
 	case ui.ScanDoneMsg:
 		next, cmd := m.routeToApp(msg)
-		text := fmt.Sprintf("%d files", msg.Count)
-		if msg.Skipped > 0 {
-			text += fmt.Sprintf(", %d skipped", msg.Skipped)
+		if next.followCancel == nil {
+			text := fmt.Sprintf("%d files", msg.Count)
+			if msg.Skipped > 0 {
+				text += fmt.Sprintf(", %d skipped", msg.Skipped)
+			}
+			if msg.Truncated {
+				text += ", truncated"
+			}
+			next.app.Status = text
 		}
-		if msg.Truncated {
-			text += ", truncated"
-		}
-		next.app.Status = text
 		return next, cmd
 
 	case ui.ScanEntriesMsg:
@@ -1137,7 +1149,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case ui.BackMsg:
 		if m.app.Active == ui.ScreenBrowser {
-			m = m.stopFollow()
+			m = m.endFollow()
 		}
 		return m.routeToApp(msg)
 
@@ -1291,7 +1303,7 @@ func (m tuiModel) scanPath(msg ui.PathScanRequestedMsg) (tea.Model, tea.Cmd) {
 		return scanReadyMsg{Host: host, Deps: deps, GNUFind: gnuFind, Browse: true}
 	}
 
-	next := m
+	next := m.endFollow()
 	next.app.Err = nil
 	return next, tea.Batch(
 		func() tea.Msg { return ui.PathScanStartedMsg{Host: host, Path: path} },
@@ -1390,13 +1402,10 @@ func (m tuiModel) handleFollowRequest(msg ui.FollowRequestedMsg) (tea.Model, tea
 
 	same := m.followCancel != nil && msg.Host == m.followHost && msg.Path == m.followPath
 	if m.followCancel != nil {
-		next := m.stopFollow()
 		if same {
-			routed, cmd := next.routeToApp(ui.StreamClosedMsg{})
-			routed.app.Status = "follow ended"
-			return routed, cmd
+			return m.endFollow(), nil
 		}
-		m = next
+		m = m.stopFollow()
 	}
 
 	followCtx, cancel := context.WithCancel(m.ctx)
@@ -1443,10 +1452,24 @@ func (m tuiModel) stopFollow() tuiModel {
 	return m
 }
 
+// endFollow stops the tail and tells the browser, so the screen does not
+// keep offering "F or esc stop" for a stream that is already gone.
+func (m tuiModel) endFollow() tuiModel {
+	if m.followCancel == nil {
+		return m
+	}
+	next := m.stopFollow()
+	routed, _ := next.routeToApp(ui.StreamClosedMsg{})
+	if strings.HasPrefix(routed.app.Status, "following ") {
+		routed.app.Status = "follow ended"
+	}
+	return routed
+}
+
 func (m tuiModel) openLibrary() (tea.Model, tea.Cmd) {
 	next := m
 	if next.app.Active == ui.ScreenBrowser {
-		next = next.stopFollow()
+		next = next.endFollow()
 	}
 	if next.app.Active != ui.ScreenViewer && next.app.Active != ui.ScreenLibrary {
 		next.app.LibraryFrom = next.app.Active

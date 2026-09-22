@@ -3,6 +3,7 @@ package viewer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -159,6 +160,10 @@ type Model struct {
 	// no search has produced a non-empty match set yet. CurrentMatchIndex
 	// reports it directly.
 	matchIdx int
+
+	// searchGen is incremented on every submitted search. A result whose
+	// Gen does not match is for a search this model has moved on from.
+	searchGen uint64
 }
 
 // New returns a Model that will load path when Init's command runs, using
@@ -247,6 +252,9 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		return next, nil
 
 	case ui.SearchResultsMsg:
+		if (msg.Path != "" && msg.Path != m.path) || (msg.Gen != 0 && msg.Gen != m.searchGen) {
+			return m, nil
+		}
 		next := m
 		next.matches = append([]ui.SearchMatch(nil), msg.Matches...)
 		if len(next.matches) > 0 {
@@ -363,18 +371,23 @@ func (m Model) submitSearch() (ui.ScreenModel, tea.Cmd) {
 	next := m
 	next.searching = false
 	next.query.Blur()
+	next.searchGen++
 
 	search := m.search
 	ctxFunc := m.ctxFunc
 	path := m.path
+	gen := next.searchGen
 
 	cmd := func() tea.Msg {
 		ctx := ctxFunc()
 		matches, err := search(ctx, path, query, false)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
 			return ui.ErrorMsg{Err: fmt.Errorf("search %s: %w", path, err)}
 		}
-		return ui.SearchResultsMsg{Query: query, Regex: false, Matches: matches}
+		return ui.SearchResultsMsg{Path: path, Gen: gen, Query: query, Regex: false, Matches: matches}
 	}
 	return next, cmd
 }

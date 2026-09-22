@@ -454,6 +454,13 @@ type FileLoadedMsg struct {
 // Sent by the search command. Handled by the viewer, which highlights the hits
 // and shows the match count.
 type SearchResultsMsg struct {
+	// Path is the local file the hits belong to. The viewer ignores a
+	// result whose path is not the file it is showing, so a search still
+	// in flight cannot paint onto the next file opened from the library.
+	Path string
+	// Gen is the search generation the request was issued for. Zero means
+	// the sender did not stamp one.
+	Gen uint64
 	// Query is the query the hits are for.
 	Query string
 	// Regex reports whether the query was treated as a pattern.

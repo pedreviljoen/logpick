@@ -262,6 +262,43 @@ func TestNewApp(t *testing.T) {
 		}
 	})
 
+	t.Run("stopping a follow does not report the cancellation", func(t *testing.T) {
+		dir := copyFixtures(t)
+		d := appDeps{
+			Transport: transport.NewMock(dir),
+			State:     newStore(t),
+			Local:     local.New(t.TempDir()),
+			Search:    local.NewNative(),
+			Host:      resolveDefault(t, "host-a"),
+			Now:       fixedClock(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)),
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errc := make(chan error, 4)
+		_, ch, err := d.startFollow(ctx, errc, "host-a", "/var/log/syslog")
+		if err != nil {
+			t.Fatalf("startFollow: %v", err)
+		}
+		done := make(chan struct{})
+		go func() {
+			for range ch {
+			}
+			close(done)
+		}()
+		cancel()
+
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("follow did not stop after cancel")
+		}
+		select {
+		case err := <-errc:
+			t.Fatalf("cancel reported %v, want silence", err)
+		default:
+		}
+	})
+
 	t.Run("--mock builds an app backed by the fixture directory, no real transport", func(t *testing.T) {
 		dir := copyFixtures(t)
 		tp := transport.NewMock(dir)

@@ -163,6 +163,20 @@ func matchesAt(n int) []ui.SearchMatch {
 	return matches
 }
 
+func TestModel_SearchResultForAnotherFileIsIgnored(t *testing.T) {
+	path := writeFile(t, "only this file\n")
+	m := viewer.New(path, noopSearch)
+	m, _ = update(t, m, ui.SearchResultsMsg{
+		Path:    path + ".other",
+		Gen:     1,
+		Query:   "other",
+		Matches: matchesAt(2),
+	})
+	if m.MatchCount() != 0 {
+		t.Fatalf("MatchCount() = %d, want 0 for a result from another file", m.MatchCount())
+	}
+}
+
 func TestModel_EscapeGoesBackToLibrary(t *testing.T) {
 	path := writeFile(t, "line\n")
 	m := viewer.New(path, noopSearch)

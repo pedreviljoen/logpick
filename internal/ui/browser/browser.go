@@ -422,6 +422,7 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 			return m, nil
 		}
 		next := m.withEntries(nil)
+		next.following = false
 		next.scanDone = false
 		next.activeScanPath = msg.Path
 		next.hasHighlight = false
@@ -473,7 +474,13 @@ func (m Model) Update(msg tea.Msg) (ui.ScreenModel, tea.Cmd) {
 		next := m
 		next.selecting = false
 		next.selectCancel = nil
+		if next.following {
+			return next, nil
+		}
 		if msg.err != nil {
+			if errors.Is(msg.err, context.Canceled) {
+				return next, nil
+			}
 			next.previewViewport.SetContent("Selection failed. Press Space to retry.")
 			return next, func() tea.Msg {
 				return ui.ErrorMsg{Err: fmt.Errorf("selecting %s:%s: %w", msg.host, msg.remote, msg.err)}
@@ -686,7 +693,15 @@ func (m Model) requestFollow() (ui.ScreenModel, tea.Cmd) {
 	if !ok || entry.IsDir {
 		return m, nil
 	}
-	return m, func() tea.Msg {
+	next := m
+	next.following = true
+	next.followPath = entry.Path
+	next.gen++
+	if next.cancel != nil {
+		next.cancel()
+		next.cancel = nil
+	}
+	return next, func() tea.Msg {
 		return ui.FollowRequestedMsg{Host: m.host, Path: entry.Path}
 	}
 }
@@ -702,6 +717,7 @@ func (m Model) handleFollowStarted(msg ui.FollowStartedMsg) (ui.ScreenModel, tea
 	next.following = true
 	next.followPath = msg.Path
 	next.previewFocused = true
+	next.gen++
 	if next.cancel != nil {
 		next.cancel()
 		next.cancel = nil
@@ -714,16 +730,14 @@ func (m Model) handleFollowStarted(msg ui.FollowStartedMsg) (ui.ScreenModel, tea
 }
 
 func (m Model) handleFollowLines(msg ui.LinesMsg) (ui.ScreenModel, tea.Cmd) {
-	if len(msg.Lines) == 0 {
+	if !m.following || len(msg.Lines) == 0 {
 		return m, nil
 	}
 	next := m
-	next.following = true
 	next.followLines = appendFollow(next.followLines, msg.Lines, followCap)
 	next.previewLines = next.followLines
 	next.previewViewport.SetContent(strings.Join(next.followLines, "\n"))
 	next.previewViewport.GotoBottom()
-	next.previewFocused = true
 	return next, nil
 }
 
@@ -779,6 +793,14 @@ func (m Model) startSelection() (ui.ScreenModel, tea.Cmd) {
 	}
 	next.selectCancel = cancel
 	next.selecting = true
+	var stop tea.Cmd
+	if m.following {
+		followPath := m.followPath
+		next.following = false
+		stop = func() tea.Msg {
+			return ui.FollowRequestedMsg{Host: m.host, Path: followPath}
+		}
+	}
 	next.previewViewport.SetContent("Fetching local snapshot for search…")
 	selector := m.selectLog
 	host := m.host
@@ -787,7 +809,7 @@ func (m Model) startSelection() (ui.ScreenModel, tea.Cmd) {
 		localPath, lines, err := selector(ctx, host, entry)
 		return logSelectedMsg{host: host, remote: entry.Path, local: localPath, lines: lines, err: err}
 	}
-	return next, cmd
+	return next, tea.Batch(cmd, stop)
 }
 
 func (m Model) startLiveSearch() (Model, tea.Cmd) {
@@ -992,7 +1014,7 @@ func (m Model) applyHighlightChange() (Model, tea.Cmd) {
 // stale (mechanic 3), rendering a cache hit without a request (mechanic
 // 4), or issuing the tea.Cmd that performs the preview request on a miss.
 func (m Model) handleDebounce(msg ui.PreviewDebounceMsg) (ui.ScreenModel, tea.Cmd) {
-	if msg.Gen != m.gen || msg.Host != m.host {
+	if m.following || msg.Gen != m.gen || msg.Host != m.host {
 		return m, nil
 	}
 
@@ -1027,6 +1049,9 @@ func (m Model) handleDebounce(msg ui.PreviewDebounceMsg) (ui.ScreenModel, tea.Cm
 	cmd := func() tea.Msg {
 		lines, err := preview(ctx, host, path)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
 			return ui.ErrorMsg{Err: fmt.Errorf("preview %s:%s: %w", host, path, err)}
 		}
 		return ui.PreviewMsg{Gen: gen, Host: host, Path: path, Lines: lines}
@@ -1048,7 +1073,7 @@ func (m Model) handlePreviewMsg(msg ui.PreviewMsg) (ui.ScreenModel, tea.Cmd) {
 	next := m
 	next.cache = cacheStore(m.cache, cacheEntry{host: msg.Host, path: msg.Path, lines: lines})
 
-	if msg.Gen == m.gen {
+	if msg.Gen == m.gen && !m.following {
 		next.previewLines = lines
 		next.previewViewport.SetContent(strings.Join(lines, "\n"))
 		next.previewViewport.GotoTop()
